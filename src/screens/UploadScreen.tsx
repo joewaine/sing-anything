@@ -27,6 +27,12 @@ type Phase =
   | { kind: 'ready'; songId: string }
   | { kind: 'error'; message: string };
 
+// Hide the URL-paste bar until YouTube bot-detection has a real fix
+// (cookies-based auth or a proxy). Flip to `true` to re-enable — the
+// backend (worker `/upload_youtube`, `uploadFromYoutube` client lib) is
+// unchanged.
+const URL_UPLOAD_ENABLED = false;
+
 const STAGE_LABEL: Record<string, string> = {
   queued: 'Queued...',
   upload: 'Downloading original...',
@@ -140,31 +146,33 @@ export default function UploadScreen({ onBack, onReady }: Props) {
               <View style={{ marginTop: 16 }}>
                 <RetroButton label="Choose file..." onPress={onPick} size="lg" />
               </View>
-              <Text style={styles.orLabel}>— or —</Text>
-              <View style={styles.urlRow}>
-                <TextInput
-                  value={ytUrl}
-                  onChangeText={setYtUrl}
-                  onSubmitEditing={onSubmitYoutube}
-                  placeholder="Paste an audio URL (SoundCloud, Bandcamp, direct mp3…)"
-                  placeholderTextColor={COLORS.softGrey}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  returnKeyType="go"
-                  style={styles.urlInput}
-                />
-                <RetroButton
-                  label="Fetch"
-                  onPress={onSubmitYoutube}
-                  size="md"
-                  variant="dark"
-                  icon="play"
-                />
-              </View>
+              {URL_UPLOAD_ENABLED && (
+                <>
+                  <Text style={styles.orLabel}>— or —</Text>
+                  <View style={styles.urlRow}>
+                    <TextInput
+                      value={ytUrl}
+                      onChangeText={setYtUrl}
+                      onSubmitEditing={onSubmitYoutube}
+                      placeholder="Paste an audio URL (SoundCloud, Bandcamp, direct mp3…)"
+                      placeholderTextColor={COLORS.softGrey}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="go"
+                      style={styles.urlInput}
+                    />
+                    <RetroButton
+                      label="Fetch"
+                      onPress={onSubmitYoutube}
+                      size="md"
+                      variant="dark"
+                      icon="play"
+                    />
+                  </View>
+                </>
+              )}
               <Text style={styles.disclaimer}>
                 Only upload songs you own or have rights to practice with.
-                SoundCloud, Bandcamp, or direct audio links work well.
-                YouTube usually blocks downloads — use a file or another source.
               </Text>
             </View>
           )}
