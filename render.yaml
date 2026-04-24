@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: sing-anything
+    runtime: static
+    buildCommand: npm ci && npx expo export -p web
+    staticPublishPath: ./dist
+    pullRequestPreviewsEnabled: false
+    headers:
+      # Expo Web emits a SPA — no server-side routing to speak of, but a
+      # conservative Permissions-Policy lets us request the microphone.
+      - path: /*
+        name: Permissions-Policy
+        value: "microphone=(self)"
+    envVars:
+      - key: EXPO_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: EXPO_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: EXPO_PUBLIC_WORKER_URL
+        sync: false

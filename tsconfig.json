@@ -1,0 +1,13 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true
+  },
+  "include": ["App.tsx", "index.ts", "src/**/*"],
+  "exclude": [
+    "node_modules",
+    "supabase",
+    "worker",
+    "babel.config.js"
+  ]
+}

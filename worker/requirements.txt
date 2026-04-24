@@ -1,0 +1,5 @@
+# Local-dev hints for editors / type checkers. Modal builds from app.py's
+# Image spec, not from this file — keep them roughly in sync manually.
+modal>=1.4.0
+demucs==4.0.1
+supabase==2.11.0
