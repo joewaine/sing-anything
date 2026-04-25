@@ -4,14 +4,22 @@ Silence-gap based: any gap ≥400 ms with RMS below -40 dBFS is a phrase
 boundary. Long phrases (>15 s) split on the longest internal gap ≥200 ms.
 Verses = groupings of 3–5 consecutive lines capped at 22 s.
 
-Note timestamps on the emitted phrases are **relative to the phrase start**,
-matching the Sing Beatles contract SessionScreen expects.
+Note timestamps on the emitted phrases are **relative to the audio clip
+start** (i.e. phrase_start - CLIP_PAD_MS, clamped to 0). This matches the
+audio file ffmpeg actually produces in slice.py: the clip starts
+CLIP_PAD_MS earlier than the phrase boundary so there's a brief lead-in
+before the first sung syllable. SessionScreen reads notes assuming
+audio-time = note-time, so the offsets must agree.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+# IMPORTANT: keep in sync with slice.py — when ffmpeg produces a clip it
+# starts max(0, phrase_start - CLIP_PAD_MS) into the original audio. Note
+# timestamps below are made relative to that same clip start.
+CLIP_PAD_MS = 150
 SILENCE_DB = -40.0
 GAP_BOUNDARY_S = 0.400
 INTERNAL_SPLIT_GAP_S = 0.200
@@ -100,10 +108,19 @@ def detect_phrases(
             line_runs.append((f0, f0 + max_frames))
 
     # 4. Build line-phrase dicts with note/lyric projection.
+    # The ffmpeg slice for a phrase begins CLIP_PAD_MS before phrase_start
+    # (clamped to 0). To make note timestamps line up with the audio file
+    # SessionScreen actually plays, we shift them by the same offset so
+    # note_t=0 corresponds to audio_t=0. Without this, the lyric highlight
+    # fires CLIP_PAD_MS too early.
+    def clip_offset(phrase_start_ms: int) -> int:
+        return max(0, phrase_start_ms - CLIP_PAD_MS)
+
     def notes_in_window(start_ms: int, end_ms: int) -> list[dict]:
+        clip0 = clip_offset(start_ms)
         sel = [n for n in notes if n["start_ms"] >= start_ms and n["end_ms"] <= end_ms]
         return [
-            {**n, "start_ms": n["start_ms"] - start_ms, "end_ms": n["end_ms"] - start_ms}
+            {**n, "start_ms": n["start_ms"] - clip0, "end_ms": n["end_ms"] - clip0}
             for n in sel
         ]
 
@@ -169,9 +186,14 @@ def detect_phrases(
         if len(group) >= VERSE_MIN_LINES:
             verse_start = group[0]["start_ms"]
             verse_end = group[-1]["end_ms"]
+            verse_clip0 = clip_offset(verse_start)
             verse_notes: list[dict] = []
+            # Each line's notes are already in line-clip-relative time
+            # (i.e. relative to clip_offset(line.start_ms)). To put them in
+            # verse-clip-relative time we need to add line_clip_start - verse_clip_start.
             for g in group:
-                offset = g["start_ms"] - verse_start
+                line_clip0 = clip_offset(g["start_ms"])
+                offset = line_clip0 - verse_clip0
                 for n in g["notes"]:
                     verse_notes.append({
                         **n,
