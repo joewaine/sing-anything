@@ -9,20 +9,23 @@ import SessionScreen from './src/screens/SessionScreen';
 import UploadScreen from './src/screens/UploadScreen';
 import WelcomeScreen from './src/screens/WelcomeScreen';
 import { ensureSignedIn } from './src/lib/auth';
-import { hasPasskey, markPasskey } from './src/lib/passkey';
+import { signedIn } from './src/lib/passkey';
 import { fetchFullPhrase } from './src/lib/phrases';
 import { currentHashRoute, pathToRoute, routeToPath, type Route } from './src/lib/routing';
 import { hasSupabaseConfig } from './src/lib/supabase';
 import { COLORS, FONTS } from './src/theme';
 
 export default function App() {
-  const [unlocked, setUnlocked] = useState(() => hasPasskey());
+  const [unlocked, setUnlocked] = useState(() => signedIn());
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [route, setRoute] = useState<Route>(() => currentHashRoute() ?? { screen: 'welcome' });
 
   useEffect(() => {
     if (!unlocked) return;
+    // The PasskeyScreen's `completeSignIn` already restored or minted a
+    // session; ensureSignedIn() is a safety net for the corner case where
+    // localStorage has an email but Supabase rejected the stashed session.
     ensureSignedIn()
       .then(() => setReady(true))
       .catch((e: Error) => setError(e.message));
@@ -80,12 +83,7 @@ export default function App() {
       <FontLoader />
       <StatusBar style="dark" />
       {!unlocked ? (
-        <PasskeyScreen
-          onUnlock={() => {
-            markPasskey();
-            setUnlocked(true);
-          }}
-        />
+        <PasskeyScreen onUnlock={() => setUnlocked(true)} />
       ) : error ? (
         <View style={styles.center}>
           <Text style={styles.errorTitle}>AUTH FAILED</Text>

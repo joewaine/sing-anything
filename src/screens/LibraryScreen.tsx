@@ -33,7 +33,6 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack }: Props) {
   const [songs, setSongs] = useState<Song[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
 
   const refresh = async () => {
     if (!hasSupabaseConfig) {
@@ -62,9 +61,6 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack }: Props) {
       const supabase = requireSupabase();
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      setCurrentUserId(user.id);
-      // Watch every song row (library is shared). `filter` is intentionally
-      // omitted so inserts/updates from OTHER users also refresh the list.
       const channel = supabase
         .channel('library-songs')
         .on(
@@ -73,6 +69,7 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack }: Props) {
             event: '*',
             schema: 'public',
             table: 'songs',
+            filter: `user_id=eq.${user.id}`,
           },
           () => void refresh(),
         )
@@ -131,7 +128,6 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack }: Props) {
             renderItem={({ item }) => (
               <SongRow
                 song={item}
-                canEdit={currentUserId !== null && item.user_id === currentUserId}
                 editing={editingId === item.id}
                 onStartEdit={() => setEditingId(item.id)}
                 onStopEdit={() => setEditingId(null)}
@@ -149,7 +145,6 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack }: Props) {
 
 type RowProps = {
   song: Song;
-  canEdit: boolean;
   editing: boolean;
   onStartEdit: () => void;
   onStopEdit: () => void;
@@ -160,7 +155,6 @@ type RowProps = {
 
 function SongRow({
   song,
-  canEdit,
   editing,
   onStartEdit,
   onStopEdit,
@@ -254,25 +248,18 @@ function SongRow({
   return (
     <View style={styles.row}>
       <View style={{ flex: 1 }}>
-        {canEdit ? (
-          <Pressable
-            onPress={onStartEdit}
-            style={({ pressed }) => (pressed ? styles.titlePressed : null)}
-          >
-            <Text style={styles.rowName} numberOfLines={1}>
-              {song.name}
-            </Text>
-          </Pressable>
-        ) : (
+        <Pressable
+          onPress={onStartEdit}
+          style={({ pressed }) => (pressed ? styles.titlePressed : null)}
+        >
           <Text style={styles.rowName} numberOfLines={1}>
             {song.name}
           </Text>
-        )}
+        </Pressable>
         {song.artist && <Text style={styles.rowArtist} numberOfLines={1}>{song.artist}</Text>}
         <Text style={[styles.rowStatus, isError && styles.rowStatusError]}>
           {STATUS_LABEL[song.status] ?? song.status}
           {isError && song.error ? ` — ${song.error}` : ''}
-          {!canEdit ? ' · shared' : ''}
         </Text>
         {rowErr && <Text style={styles.rowError}>{rowErr}</Text>}
       </View>
@@ -285,35 +272,33 @@ function SongRow({
             <Text style={styles.chevron}>▶</Text>
           </Pressable>
         )}
-        {canEdit && (
-          confirmingDelete ? (
-            <View style={styles.confirmRow}>
-              <Pressable
-                onPress={doDelete}
-                disabled={deleting}
-                style={({ pressed }) => [styles.confirmBtn, pressed && styles.confirmBtnPressed]}
-              >
-                <Text style={styles.confirmBtnLabel}>
-                  {deleting ? '...' : 'Delete'}
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={() => setConfirmingDelete(false)}
-                disabled={deleting}
-                style={({ pressed }) => [styles.cancelBtn, pressed && styles.cancelBtnPressed]}
-              >
-                <Text style={styles.cancelBtnLabel}>Cancel</Text>
-              </Pressable>
-            </View>
-          ) : (
+        {confirmingDelete ? (
+          <View style={styles.confirmRow}>
             <Pressable
-              onPress={() => setConfirmingDelete(true)}
-              style={({ pressed }) => [styles.deleteBtn, pressed && styles.deleteBtnPressed]}
-              hitSlop={6}
+              onPress={doDelete}
+              disabled={deleting}
+              style={({ pressed }) => [styles.confirmBtn, pressed && styles.confirmBtnPressed]}
             >
-              <Text style={styles.deleteX}>×</Text>
+              <Text style={styles.confirmBtnLabel}>
+                {deleting ? '...' : 'Delete'}
+              </Text>
             </Pressable>
-          )
+            <Pressable
+              onPress={() => setConfirmingDelete(false)}
+              disabled={deleting}
+              style={({ pressed }) => [styles.cancelBtn, pressed && styles.cancelBtnPressed]}
+            >
+              <Text style={styles.cancelBtnLabel}>Cancel</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Pressable
+            onPress={() => setConfirmingDelete(true)}
+            style={({ pressed }) => [styles.deleteBtn, pressed && styles.deleteBtnPressed]}
+            hitSlop={6}
+          >
+            <Text style={styles.deleteX}>×</Text>
+          </Pressable>
         )}
       </View>
     </View>
