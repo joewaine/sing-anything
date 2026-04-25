@@ -144,6 +144,13 @@ def _yt_download(url: str, dest: Path) -> dict:
         proxy_url = os.environ.get("PROXY_URL")
         if proxy_url:
             opts["proxy"] = proxy_url
+            # Be patient with transient fragment errors — residential
+            # exits sometimes drop a packet mid-stream, and YouTube's
+            # signed-URL geo-checks can flake when the proxy randomizes
+            # the exit between metadata fetch and media fetch.
+            opts["retries"] = 8
+            opts["fragment_retries"] = 8
+            opts["socket_timeout"] = 30
             print(f"[_yt_download] routing YouTube via residential proxy")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
