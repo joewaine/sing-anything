@@ -51,6 +51,12 @@ image = (
     )
     # yt-dlp for YouTube audio ingest (separate layer so we can bump it
     # independently — yt-dlp updates frequently to track YouTube changes).
+    # NOTE: We tested the bgutil-ytdlp-pot-provider plugin (Proof-of-Origin
+    # tokens via Node helper) and confirmed it loads correctly, but
+    # YouTube's cloud-IP block fires *before* the PO token is checked,
+    # so it didn't help. Reverted to vanilla yt-dlp; cookies or a
+    # residential proxy are the only realistic workarounds for YouTube on
+    # Modal IPs.
     .pip_install("yt-dlp")
     # Demucs weights live under ~/.cache/torch; that path is a Modal Volume
     # at runtime (see `torch_cache`), so baking them into the image would be
@@ -123,15 +129,22 @@ def _yt_download(url: str, dest: Path) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Try alternate YouTube player clients in order; tv_embedded and mweb
-        # sometimes bypass the "sign in to confirm you're not a bot" wall that
-        # hits cloud IPs (Modal, AWS, GCP) on the default web client.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv_embedded", "mweb", "web_safari", "web"],
-            },
-        },
     }
+    # YouTube only: route through IPRoyal residential proxy (env var
+    # PROXY_URL injected via the `iproyal` Modal secret). Modal's
+    # datacenter IPs trip YouTube's bot wall regardless of player client
+    # or PO tokens — a residential exit hop sails past it. Other sources
+    # (SoundCloud, Bandcamp, direct mp3) skip the proxy to save bandwidth.
+    is_youtube = (
+        "youtube.com" in url
+        or "youtu.be" in url
+        or "music.youtube.com" in url
+    )
+    if is_youtube:
+        proxy_url = os.environ.get("PROXY_URL")
+        if proxy_url:
+            opts["proxy"] = proxy_url
+            print(f"[_yt_download] routing YouTube via residential proxy")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -166,7 +179,7 @@ def _yt_download(url: str, dest: Path) -> dict:
 @app.function(
     gpu="T4",
     timeout=1800,
-    secrets=[modal.Secret.from_name("supabase")],
+    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
     volumes=MODEL_VOLUMES,
 )
 def demucs_split(original_url: str, song_id: str) -> dict:
@@ -205,7 +218,7 @@ def demucs_split(original_url: str, song_id: str) -> dict:
 @app.function(
     gpu="T4",
     timeout=1800,
-    secrets=[modal.Secret.from_name("supabase")],
+    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
     volumes=MODEL_VOLUMES,
 )
 def process_song(
@@ -444,7 +457,7 @@ def process_song(
 
 
 @app.function(
-    secrets=[modal.Secret.from_name("supabase")],
+    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
     timeout=120,
     min_containers=0,
 )
@@ -595,6 +608,84 @@ def api():
         return {"job_id": job_id}
 
     return web
+
+
+@app.function(
+    timeout=120,
+    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
+    volumes=MODEL_VOLUMES,
+)
+def yt_smoke(youtube_url: str) -> dict:
+    """No-pipeline yt-dlp smoke. Just downloads to /tmp and returns metadata.
+    Useful for confirming PO Tokens / cookies / proxy work without running
+    a full GPU pipeline. Returns the title + size on success, or error on
+    failure.
+    """
+    import tempfile
+    import traceback
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "yt_smoke.mp3"
+            info = _yt_download(youtube_url, dest)
+            return {
+                "ok": True,
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "duration": info.get("duration"),
+                "bytes": dest.stat().st_size,
+            }
+    except YoutubeBlockedError as e:
+        return {"ok": False, "blocked": True, "error": str(e)}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+
+@app.local_entrypoint()
+def yt_test(youtube_url: str) -> None:
+    """Run: modal run worker/app.py::yt_test --youtube-url <URL>"""
+    import json as _json
+    print(_json.dumps(yt_smoke.remote(youtube_url=youtube_url), indent=2)[:1500])
+
+
+@app.function(secrets=[modal.Secret.from_name("iproyal")], timeout=30)
+def check_proxy_ip() -> dict:
+    """Verify the residential proxy is actually changing our exit IP.
+    Returns IP-as-seen-by-the-internet via the proxy AND without it."""
+    import os
+    import urllib.request
+    import json as _json
+
+    proxy_url = os.environ.get("PROXY_URL")
+    out: dict = {"proxy_url_set": bool(proxy_url)}
+
+    def fetch_ip(handler=None) -> str:
+        opener = urllib.request.build_opener(handler) if handler else urllib.request.build_opener()
+        with opener.open("https://api.ipify.org?format=json", timeout=15) as r:
+            return _json.loads(r.read())["ip"]
+
+    try:
+        out["direct_ip"] = fetch_ip()
+    except Exception as e:
+        out["direct_ip_error"] = str(e)
+
+    if proxy_url:
+        try:
+            handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            out["proxy_ip"] = fetch_ip(handler)
+        except Exception as e:
+            out["proxy_ip_error"] = str(e)
+    return out
+
+
+@app.local_entrypoint()
+def proxy_check() -> None:
+    import json as _json
+    print(_json.dumps(check_proxy_ip.remote(), indent=2))
 
 
 @app.local_entrypoint()

@@ -27,11 +27,9 @@ type Phase =
   | { kind: 'ready'; songId: string }
   | { kind: 'error'; message: string };
 
-// Hide the URL-paste bar until YouTube bot-detection has a real fix
-// (cookies-based auth or a proxy). Flip to `true` to re-enable — the
-// backend (worker `/upload_youtube`, `uploadFromYoutube` client lib) is
-// unchanged.
-const URL_UPLOAD_ENABLED = false;
+// URL paste re-enabled — YouTube ingest works again now that the worker
+// routes via IPRoyal residential proxy.
+const URL_UPLOAD_ENABLED = true;
 
 const STAGE_LABEL: Record<string, string> = {
   queued: 'Queued...',
@@ -154,7 +152,7 @@ export default function UploadScreen({ onBack, onReady }: Props) {
                       value={ytUrl}
                       onChangeText={setYtUrl}
                       onSubmitEditing={onSubmitYoutube}
-                      placeholder="Paste an audio URL (SoundCloud, Bandcamp, direct mp3…)"
+                      placeholder="Paste a URL (YouTube, SoundCloud, Bandcamp…)"
                       placeholderTextColor={COLORS.softGrey}
                       autoCapitalize="none"
                       autoCorrect={false}
