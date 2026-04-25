@@ -13,28 +13,38 @@ type Props = {
   onBack: () => void;
 };
 
-// Currently only verses are exposed in the UI. Lines remain in the DB so this
-// can flip back to a tab selector without a worker rebuild.
-const PHRASE_TYPE = 'verse' as const;
-
+// Prefer verses; fall back to lines for short / sparse songs that didn't
+// emit any verse groupings.
 export default function PickerScreen({ songId, onPick, onBack }: Props) {
   const [song, setSong] = useState<Song | null>(null);
   const [phrases, setPhrases] = useState<PhraseListRow[] | null>(null);
+  const [phraseType, setPhraseType] = useState<'verse' | 'line' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setPhrases(null);
+    setPhraseType(null);
     setError(null);
     (async () => {
       try {
-        const [s, rows] = await Promise.all([
+        const [s, verses] = await Promise.all([
           getSong(songId),
-          listPhrases(songId, PHRASE_TYPE),
+          listPhrases(songId, 'verse'),
         ]);
         if (cancelled) return;
         setSong(s);
-        setPhrases(rows);
+        if (verses.length > 0) {
+          setPhrases(verses);
+          setPhraseType('verse');
+          return;
+        }
+        // No verses → song is short or sparse; show its individual lines
+        // instead of an empty state.
+        const lines = await listPhrases(songId, 'line');
+        if (cancelled) return;
+        setPhrases(lines);
+        setPhraseType(lines.length > 0 ? 'line' : null);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -68,22 +78,29 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
         ) : phrases.length === 0 ? (
           <View style={styles.center}>
             <Text style={styles.emptyIcon}>🎶</Text>
-            <Text style={styles.emptyTitle}>No verses here</Text>
+            <Text style={styles.emptyTitle}>No phrases yet</Text>
             <Text style={styles.emptyBody}>
-              This song was too short (or too sparse) to group its lines into verses.
-              Re-uploading a longer track should help.
+              The pipeline didn't find any singable phrases. This usually means
+              vocals were too quiet or the track was instrumental.
             </Text>
             {error && <Text style={styles.errorText}>{error}</Text>}
           </View>
         ) : (
-          <FlatList
-            data={phrases}
-            keyExtractor={(p) => p.id}
-            ItemSeparatorComponent={() => <View style={styles.sep} />}
-            renderItem={({ item, index }) => (
-              <PhraseRow phrase={item} index={index} onPick={onPick} />
+          <>
+            {phraseType === 'line' && (
+              <Text style={styles.modeNote}>
+                This song is short — showing individual lines.
+              </Text>
             )}
-          />
+            <FlatList
+              data={phrases}
+              keyExtractor={(p) => p.id}
+              ItemSeparatorComponent={() => <View style={styles.sep} />}
+              renderItem={({ item, index }) => (
+                <PhraseRow phrase={item} index={index} onPick={onPick} />
+              )}
+            />
+          </>
         )}
       </View>
     </Chrome>
@@ -145,6 +162,13 @@ const styles = StyleSheet.create({
     maxWidth: 320,
   },
   errorText: { fontFamily: FONTS.monaco, fontSize: 11, color: '#c00', marginTop: 8 },
+  modeNote: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.softGrey,
+    marginBottom: 8,
+    paddingHorizontal: 6,
+  },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
