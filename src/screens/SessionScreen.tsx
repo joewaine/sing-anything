@@ -50,6 +50,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   // User can mute mid-take via the toggle; the gain ramps to 0 without
   // re-decoding or re-scheduling.
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
+  const [listenPaused, setListenPaused] = useState(false);
   // currentMs lives in a ref so frame-rate updates don't re-render the screen.
   // PitchRibbon reads it imperatively via rAF.
   const currentMsRef = useRef(0);
@@ -57,6 +58,11 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const referenceRef = useRef<Audio.Sound | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const countInRef = useRef<CountInHandleWithVocals | null>(null);
+  const listenClockRef = useRef<{
+    pause: () => void;
+    resume: () => void;
+    reset: () => void;
+  } | null>(null);
   const playbackRef = useRef<Audio.Sound | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
   const listenRafRef = useRef<number | null>(null);
@@ -170,6 +176,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
 
   const playReference = useCallback(async () => {
     setStage('listening');
+    setListenPaused(false);
     (currentMsRef.current = 0);
 
     // IMPORTANT — do NOT acquire the mic here. Android flips the device into
@@ -199,14 +206,76 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     await sound.playAsync();
 
     // Drive currentMsRef at 60Hz for smooth cursor motion (expo-av's own
-    // status callbacks only fire at ~20Hz, which looks chunky).
-    const startedAt = performance.now();
-    const tick = () => {
-      currentMsRef.current = performance.now() - startedAt;
-      listenRafRef.current = requestAnimationFrame(tick);
+    // status callbacks only fire at ~20Hz, which looks chunky). Tracking
+    // base + accumulated lets us pause without losing position.
+    let base = performance.now();
+    let accumulated = 0;
+    listenClockRef.current = {
+      pause() {
+        accumulated += performance.now() - base;
+        if (listenRafRef.current !== null) cancelAnimationFrame(listenRafRef.current);
+        listenRafRef.current = null;
+      },
+      resume() {
+        base = performance.now();
+        if (listenRafRef.current === null) {
+          const tick = () => {
+            currentMsRef.current = accumulated + (performance.now() - base);
+            listenRafRef.current = requestAnimationFrame(tick);
+          };
+          listenRafRef.current = requestAnimationFrame(tick);
+        }
+      },
+      reset() {
+        base = performance.now();
+        accumulated = 0;
+        currentMsRef.current = 0;
+      },
     };
-    listenRafRef.current = requestAnimationFrame(tick);
+    listenClockRef.current.resume();
   }, [phrase]);
+
+  const pauseListen = useCallback(async () => {
+    if (!referenceRef.current) return;
+    await referenceRef.current.pauseAsync().catch(() => {});
+    listenClockRef.current?.pause();
+    setListenPaused(true);
+  }, []);
+
+  const resumeListen = useCallback(async () => {
+    if (!referenceRef.current) return;
+    listenClockRef.current?.resume();
+    await referenceRef.current.playAsync().catch(() => {});
+    setListenPaused(false);
+  }, []);
+
+  const restartListen = useCallback(async () => {
+    if (!referenceRef.current) return;
+    await referenceRef.current.setPositionAsync(0).catch(() => {});
+    listenClockRef.current?.reset();
+    if (listenPaused) {
+      // user explicitly hit restart while paused — keep paused state
+      return;
+    }
+    await referenceRef.current.playAsync().catch(() => {});
+  }, [listenPaused]);
+
+  const restartRecording = useCallback(async () => {
+    // Abort the in-progress take and re-enter count-in. We discard the
+    // partial recording (it'd be unaligned anyway).
+    countInRef.current?.stop();
+    countInRef.current = null;
+    try {
+      await recorderRef.current?.stop();
+    } catch {
+      // Recorder might not be in a stoppable state — ignore.
+    }
+    recorderRef.current = null;
+    setMicStream(null);
+    currentMsRef.current = 0;
+    // Re-enter the same flow that started the original take.
+    void startCountdown();
+  }, []);
 
   const startCountdown = useCallback(async () => {
     setStage('countdown');
@@ -344,12 +413,25 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             <Text style={styles.hint}>🎧 headphones recommended</Text>
           </>
         )}
-        {stage === 'listening' && <Text style={styles.stageLabel}>Listening…</Text>}
+        {stage === 'listening' && (
+          <View style={styles.controlRow}>
+            <RetroButton
+              label={listenPaused ? 'Resume' : 'Pause'}
+              icon={listenPaused ? 'play' : null}
+              onPress={listenPaused ? resumeListen : pauseListen}
+              size="md"
+            />
+            <RetroButton label="Restart" onPress={restartListen} size="md" />
+          </View>
+        )}
         {stage === 'countdown' && (
           <Text style={styles.countdown}>{countdown || ' '}</Text>
         )}
         {stage === 'recording' && (
-          <RetroButton label="Stop" onPress={stopRecording} variant="danger" size="lg" />
+          <View style={styles.controlRow}>
+            <RetroButton label="Restart" onPress={restartRecording} size="md" />
+            <RetroButton label="Stop" onPress={stopRecording} variant="danger" size="md" />
+          </View>
         )}
         {stage === 'done' && (
           <DoneView
@@ -605,6 +687,7 @@ const styles = StyleSheet.create({
     color: COLORS.black,
   },
   hint: { fontFamily: FONTS.monaco, fontSize: 12 },
+  controlRow: { flexDirection: 'row', gap: 12, alignItems: 'center' },
   doneWrap: { alignItems: 'center', gap: 10, maxWidth: 420, width: '100%' },
   savedLabel: {
     fontFamily: FONTS.chicago,
