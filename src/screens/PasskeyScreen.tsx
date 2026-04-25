@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native';
 import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
-import { completeSignIn, requestMagicLink } from '../lib/passkey';
+import { requestMagicLink } from '../lib/passkey';
 import { BORDER_1BIT, COLORS, FONTS } from '../theme';
 
 type Props = {
@@ -12,14 +12,11 @@ type Props = {
 type Phase =
   | { kind: 'idle' }
   | { kind: 'sending' }
-  | { kind: 'sent' }
+  | { kind: 'sent'; email: string }
   | { kind: 'error'; message: string };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Stubbed magic-link sign-in. The UX is identical to the real flow we'll
- *  ship later (email → check inbox → click). For now the "Continue without
- *  email" button skips the inbox step. */
 export default function PasskeyScreen({ onUnlock }: Props) {
   const [email, setEmail] = useState('');
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
@@ -33,26 +30,13 @@ export default function PasskeyScreen({ onUnlock }: Props) {
     }
     try {
       setPhase({ kind: 'sending' });
-      await requestMagicLink(e);
-      setPhase({ kind: 'sent' });
-    } catch (err) {
-      setPhase({
-        kind: 'error',
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
-
-  const skipAndContinue = async () => {
-    const e = email.trim().toLowerCase();
-    if (!EMAIL_RE.test(e)) {
-      setPhase({ kind: 'error', message: 'Enter your email above first.' });
-      return;
-    }
-    try {
-      setPhase({ kind: 'sending' });
-      await completeSignIn(e);
-      onUnlock();
+      const { immediate } = await requestMagicLink(e);
+      if (immediate) {
+        // Demo path — signed in already. Hand off to App.
+        onUnlock();
+      } else {
+        setPhase({ kind: 'sent', email: e });
+      }
     } catch (err) {
       setPhase({
         kind: 'error',
@@ -78,21 +62,19 @@ export default function PasskeyScreen({ onUnlock }: Props) {
             <Text style={styles.sentTitle}>Check your inbox</Text>
             <Text style={styles.sentBody}>
               We sent a sign-in link to{'\n'}
-              <Text style={styles.sentEmail}>{email}</Text>
+              <Text style={styles.sentEmail}>{phase.email}</Text>
             </Text>
             <Text style={styles.sentHint}>
-              Click the link to continue. (Demo: emails aren't actually being
-              sent yet — use the button below.)
+              Click the link in the email to finish signing in. The page will
+              update automatically.
             </Text>
-            <View style={{ marginTop: 18 }}>
-              <RetroButton
-                label="Continue without email →"
-                onPress={skipAndContinue}
-                size="lg"
-                variant="dark"
-              />
-            </View>
-            <Text style={styles.tinyLink} onPress={() => setPhase({ kind: 'idle' })}>
+            <Text
+              style={styles.tinyLink}
+              onPress={() => {
+                setEmail('');
+                setPhase({ kind: 'idle' });
+              }}
+            >
               Use a different email
             </Text>
           </View>
@@ -215,7 +197,7 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: COLORS.softGrey,
     textDecorationLine: 'underline',
-    marginTop: 14,
+    marginTop: 18,
   },
   bottom: { alignItems: 'center' },
   hint: {

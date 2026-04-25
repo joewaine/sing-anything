@@ -8,28 +8,45 @@ import PickerScreen from './src/screens/PickerScreen';
 import SessionScreen from './src/screens/SessionScreen';
 import UploadScreen from './src/screens/UploadScreen';
 import WelcomeScreen from './src/screens/WelcomeScreen';
-import { ensureSignedIn } from './src/lib/auth';
-import { signedIn, signOut } from './src/lib/passkey';
+import { signOut } from './src/lib/passkey';
 import { fetchFullPhrase } from './src/lib/phrases';
 import { currentHashRoute, pathToRoute, routeToPath, type Route } from './src/lib/routing';
-import { hasSupabaseConfig } from './src/lib/supabase';
+import { hasSupabaseConfig, requireSupabase } from './src/lib/supabase';
 import { COLORS, FONTS } from './src/theme';
 
 export default function App() {
-  const [unlocked, setUnlocked] = useState(() => signedIn());
-  const [ready, setReady] = useState(false);
+  // `unlocked` is null until we've finished checking the Supabase session
+  // on cold load. true = show app, false = show PasskeyScreen, null = the
+  // brief loading state before either decision.
+  const [unlocked, setUnlocked] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [route, setRoute] = useState<Route>(() => currentHashRoute() ?? { screen: 'welcome' });
 
+  // Source of truth for "are we signed in?" is Supabase's session. On cold
+  // load, supabase-js parses the URL hash for magic-link tokens (we
+  // configured `detectSessionInUrl: true` in supabase.ts), then fires
+  // SIGNED_IN. We listen for that and update `unlocked` accordingly.
   useEffect(() => {
-    if (!unlocked) return;
-    // The PasskeyScreen's `completeSignIn` already restored or minted a
-    // session; ensureSignedIn() is a safety net for the corner case where
-    // localStorage has an email but Supabase rejected the stashed session.
-    ensureSignedIn()
-      .then(() => setReady(true))
-      .catch((e: Error) => setError(e.message));
-  }, [unlocked]);
+    if (!hasSupabaseConfig) {
+      setUnlocked(false);
+      return;
+    }
+    const supabase = requireSupabase();
+
+    void supabase.auth.getSession().then(({ data }) => {
+      setUnlocked(!!data.session);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        setUnlocked(!!session);
+      } else if (event === 'SIGNED_OUT') {
+        setUnlocked(false);
+      }
+    });
+
+    return () => sub.subscription.unsubscribe();
+  }, []);
 
   // Browser history ⇆ route. On web, listen for popstate (back/forward) and
   // pushState on route changes so the URL reflects the current screen.
@@ -82,24 +99,16 @@ export default function App() {
     <>
       <FontLoader />
       <StatusBar style="dark" />
-      {!unlocked ? (
+      {unlocked === null ? (
+        <View style={styles.center}>
+          <ActivityIndicator color={COLORS.black} />
+        </View>
+      ) : !unlocked ? (
         <PasskeyScreen onUnlock={() => setUnlocked(true)} />
       ) : error ? (
         <View style={styles.center}>
           <Text style={styles.errorTitle}>AUTH FAILED</Text>
           <Text style={styles.errorBody}>{error}</Text>
-          <Text style={styles.errorHint}>
-            Enable "Anonymous Sign-ins" in Supabase → Authentication → Providers.
-          </Text>
-        </View>
-      ) : !ready ? (
-        <View style={styles.center}>
-          <ActivityIndicator color={COLORS.black} />
-          {!hasSupabaseConfig && (
-            <Text style={styles.errorHint}>
-              No Supabase env vars set — running in shell-only mode.
-            </Text>
-          )}
         </View>
       ) : route.screen === 'welcome' ? (
         <WelcomeScreen onContinue={() => setRoute({ screen: 'library' })} />
@@ -108,9 +117,9 @@ export default function App() {
           onUpload={() => setRoute({ screen: 'upload' })}
           onPickSong={(song) => setRoute({ screen: 'picker', songId: song.id })}
           onSignOut={() => {
-            signOut();
-            setUnlocked(false);
-            setReady(false);
+            void signOut();
+            // onAuthStateChange will fire SIGNED_OUT and flip `unlocked`,
+            // but reset the route immediately so the UI snaps back.
             setRoute({ screen: 'welcome' });
           }}
         />
