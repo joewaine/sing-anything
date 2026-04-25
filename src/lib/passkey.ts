@@ -22,6 +22,14 @@ import { hasSupabaseConfig, requireSupabase } from './supabase';
 const CURRENT_EMAIL_KEY = 'sa.current_email';
 const SESSION_KEY_PREFIX = 'sa.session.';
 
+// Demo account: this email signs into a real email-auth Supabase user that
+// owns the songs already in the DB. Other emails get a fresh anonymous
+// session (and thus an empty library). The password lives in the bundle —
+// same security model as the previous "singsong" passkey, since "Continue
+// without email" already lets anyone in as some user.
+const DEMO_EMAIL = 'demo@sing-anything.app';
+const DEMO_PASSWORD = 'gjvVEiw5PEVvCb7dBF9nuzsJYnSldjK';
+
 function storage(): Storage | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -77,7 +85,8 @@ export async function completeSignIn(email: string): Promise<void> {
   }
 
   const supabase = requireSupabase();
-  const key = emailKey(email);
+  const normalized = email.trim().toLowerCase();
+  const key = emailKey(normalized);
   const store = storage();
   const stored = store?.getItem(key);
 
@@ -93,7 +102,7 @@ export async function completeSignIn(email: string): Promise<void> {
         return;
       }
       // Stored session is rejected (refresh token expired etc.) — fall
-      // through and mint a fresh anon user for this email.
+      // through and re-mint a session for this email.
       console.warn('stored session rejected, creating fresh:', error);
       store?.removeItem(key);
     } catch (e) {
@@ -102,10 +111,25 @@ export async function completeSignIn(email: string): Promise<void> {
     }
   }
 
-  const { data, error } = await supabase.auth.signInAnonymously();
-  if (error) throw error;
-  if (data.session && store) {
-    store.setItem(key, JSON.stringify(data.session));
+  // Demo account uses real password auth so we can return to the same
+  // user_id (= access to the seed songs). Every other email gets an
+  // anonymous session.
+  let session: Session | null = null;
+  if (normalized === DEMO_EMAIL) {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: DEMO_EMAIL,
+      password: DEMO_PASSWORD,
+    });
+    if (error) throw error;
+    session = data.session;
+  } else {
+    const { data, error } = await supabase.auth.signInAnonymously();
+    if (error) throw error;
+    session = data.session;
+  }
+
+  if (session && store) {
+    store.setItem(key, JSON.stringify(session));
   }
   setCurrentEmail(email);
 }
