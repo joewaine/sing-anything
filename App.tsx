@@ -9,7 +9,7 @@ import SessionScreen from './src/screens/SessionScreen';
 import UploadScreen from './src/screens/UploadScreen';
 import WelcomeScreen from './src/screens/WelcomeScreen';
 import { ensureSignedIn } from './src/lib/auth';
-import { signedIn } from './src/lib/passkey';
+import { signedIn, signOut } from './src/lib/passkey';
 import { fetchFullPhrase } from './src/lib/phrases';
 import { currentHashRoute, pathToRoute, routeToPath, type Route } from './src/lib/routing';
 import { hasSupabaseConfig } from './src/lib/supabase';
@@ -107,7 +107,12 @@ export default function App() {
         <LibraryScreen
           onUpload={() => setRoute({ screen: 'upload' })}
           onPickSong={(song) => setRoute({ screen: 'picker', songId: song.id })}
-          onBack={() => setRoute({ screen: 'welcome' })}
+          onSignOut={() => {
+            signOut();
+            setUnlocked(false);
+            setReady(false);
+            setRoute({ screen: 'welcome' });
+          }}
         />
       ) : route.screen === 'upload' ? (
         <UploadScreen
