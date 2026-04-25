@@ -66,7 +66,7 @@ export default function PasskeyScreen({ onUnlock }: Props) {
       <View style={styles.container}>
         <View style={styles.top}>
           <Text style={styles.emoji}>🍏</Text>
-          <Text style={styles.title}>Sing Anything</Text>
+          <Text style={styles.title}>Sing All The Time</Text>
           <Text style={styles.subtitle}>
             Sign in with your email — your library and recordings stay tied to
             it.

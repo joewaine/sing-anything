@@ -8,7 +8,7 @@ type Props = {
 };
 
 /** The outer "window" frame — pinstripe title bar + bordered body. */
-export default function Chrome({ children, title = 'Sing Anything', contentStyle }: Props) {
+export default function Chrome({ children, title = 'Sing All The Time', contentStyle }: Props) {
   return (
     <View style={styles.outer}>
       <View style={styles.frame}>

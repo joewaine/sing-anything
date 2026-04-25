@@ -1,4 +1,4 @@
-# Sing Anything
+# Sing All The Time
 
 Upload any song, the app stems it with Demucs, detects phrases, and drops you into the same practice-with-pitch-feedback UI as [Sing Beatles](../sing-beatles/). Native (iOS + Android) via Expo.
 

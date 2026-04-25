@@ -11,7 +11,7 @@ export default function WelcomeScreen({ onContinue }: Props) {
       <View style={styles.container}>
         <View style={styles.top}>
           <Text style={styles.apple}>🎤</Text>
-          <Text style={styles.title}>Sing Anything</Text>
+          <Text style={styles.title}>Sing All The Time</Text>
           <Text style={styles.subtitle}>Upload a song. Practice a phrase. Sing it back.</Text>
         </View>
 
