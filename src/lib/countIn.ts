@@ -15,10 +15,20 @@ export type CountInOptions = {
   beats?: number;
   backingUrl: string | null;
   backingVolume?: number;
+  /** Optional reference vocals to play in sync with the backing track.
+   *  When provided, the gain node is exposed via VocalsHandle so the UI
+   *  can mute/unmute mid-take without re-scheduling. */
+  vocalsUrl?: string | null;
+  vocalsEnabled?: boolean;
+  vocalsVolume?: number;
   onBeat?: (beatNumber: number) => void;
   onBackingStart?: () => void;
   onPositionMs?: (ms: number) => void;
   onBackingEnd?: () => void;
+};
+
+export type CountInHandleWithVocals = CountInHandle & {
+  setVocalsEnabled: (enabled: boolean) => void;
 };
 
 function scheduleClick(ctx: AudioContext, t: number, accent: boolean): void {
@@ -36,12 +46,15 @@ function scheduleClick(ctx: AudioContext, t: number, accent: boolean): void {
 
 export async function startCountInAndBacking(
   opts: CountInOptions,
-): Promise<CountInHandle> {
+): Promise<CountInHandleWithVocals> {
   const {
     bpm,
     beats = 4,
     backingUrl,
     backingVolume = 0.55,
+    vocalsUrl = null,
+    vocalsEnabled = true,
+    vocalsVolume = 0.85,
     onBeat,
     onBackingStart,
     onPositionMs,
@@ -49,17 +62,25 @@ export async function startCountInAndBacking(
   } = opts;
 
   const ctx = getAudioContext();
-  if (!ctx) return { stop: () => {} };
-
-  // Preload the backing buffer (cache-hit if we already warmed during Listen).
-  let backing: AudioBuffer | null = null;
-  if (backingUrl) {
-    try {
-      backing = await getDecodedBuffer(backingUrl);
-    } catch (e) {
-      console.warn('backing load failed:', e);
-    }
+  if (!ctx) {
+    return { stop: () => {}, setVocalsEnabled: () => {} };
   }
+
+  // Preload buffers in parallel (cache-hit if already warmed during Listen).
+  const [backing, vocals] = await Promise.all([
+    backingUrl
+      ? getDecodedBuffer(backingUrl).catch((e) => {
+          console.warn('backing load failed:', e);
+          return null;
+        })
+      : Promise.resolve(null),
+    vocalsUrl
+      ? getDecodedBuffer(vocalsUrl).catch((e) => {
+          console.warn('vocals load failed:', e);
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
 
   const beatSec = 60 / bpm;
   const startAt = ctx.currentTime + 0.1;
@@ -80,6 +101,20 @@ export async function startCountInAndBacking(
     if (onBackingEnd) {
       source.onended = () => onBackingEnd();
     }
+  }
+
+  // Vocals share the same `backingAt` clock so they stay locked to the
+  // backing. Volume is controlled by `vocalsGain`, which the caller can
+  // flip via the returned setVocalsEnabled() — no resampling, no re-decode.
+  let vocalsSource: AudioBufferSourceNode | null = null;
+  let vocalsGain: GainNode | null = null;
+  if (vocals) {
+    vocalsSource = ctx.createBufferSource();
+    vocalsSource.buffer = vocals;
+    vocalsGain = ctx.createGain();
+    vocalsGain.gain.value = vocalsEnabled ? vocalsVolume : 0;
+    vocalsSource.connect(vocalsGain).connect(ctx.destination);
+    vocalsSource.start(backingAt);
   }
 
   const timers: ReturnType<typeof setTimeout>[] = [];
@@ -120,7 +155,19 @@ export async function startCountInAndBacking(
         source.onended = null; // prevent double-fire via stop()
         try { source.stop(); } catch { /* already stopped */ }
       }
+      if (vocalsSource) {
+        try { vocalsSource.stop(); } catch { /* already stopped */ }
+      }
       // IMPORTANT: do NOT close the shared AudioContext here.
+    },
+    setVocalsEnabled: (enabled: boolean) => {
+      if (!vocalsGain || !ctx) return;
+      // Tiny ramp avoids a click on instant gain changes.
+      const target = enabled ? vocalsVolume : 0;
+      const t = ctx.currentTime;
+      vocalsGain.gain.cancelScheduledValues(t);
+      vocalsGain.gain.setValueAtTime(vocalsGain.gain.value, t);
+      vocalsGain.gain.linearRampToValueAtTime(target, t + 0.03);
     },
   };
 }

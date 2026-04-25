@@ -10,7 +10,7 @@ import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
 import { requestFeedback, type FeedbackResult } from '../lib/feedback';
 import { createRecorder, type Recorder } from '../lib/recorder';
-import { startCountInAndBacking, type CountInHandle } from '../lib/countIn';
+import { startCountInAndBacking, type CountInHandleWithVocals } from '../lib/countIn';
 import { prefetchBuffer } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
@@ -46,13 +46,17 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const [feedback, setFeedback] = useState<FeedbackResult | null>(null);
   const [feedbackPending, setFeedbackPending] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  // Default to ON — the lead vocal acts as a guide track during recording.
+  // User can mute mid-take via the toggle; the gain ramps to 0 without
+  // re-decoding or re-scheduling.
+  const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
   // currentMs lives in a ref so frame-rate updates don't re-render the screen.
   // PitchRibbon reads it imperatively via rAF.
   const currentMsRef = useRef(0);
 
   const referenceRef = useRef<Audio.Sound | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
-  const countInRef = useRef<CountInHandle | null>(null);
+  const countInRef = useRef<CountInHandleWithVocals | null>(null);
   const playbackRef = useRef<Audio.Sound | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
   const listenRafRef = useRef<number | null>(null);
@@ -229,6 +233,8 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         beats: 4,
         backingUrl,
         backingVolume: BACKING_VOLUME,
+        vocalsUrl: phrase.vocals_url,
+        vocalsEnabled: leadVocalEnabled,
         onBeat: (n) => setCountdown(n),
         onBackingStart: () => {
           setStage('recording');
@@ -248,7 +254,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase]);
+  }, [phrase, leadVocalEnabled]);
+
+  // When the toggle flips mid-take, ramp the existing gain instead of
+  // re-scheduling — no audible re-trigger and no buffer re-decode.
+  useEffect(() => {
+    countInRef.current?.setVocalsEnabled(leadVocalEnabled);
+  }, [leadVocalEnabled]);
 
   const showRibbon = stage !== 'idle' && stage !== 'error';
 
@@ -304,6 +316,24 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             currentMsRef={currentMsRef}
             active={stage === 'recording'}
           />
+          <Pressable
+            onPress={() => setLeadVocalEnabled((v) => !v)}
+            style={({ pressed }) => [
+              styles.vocalToggle,
+              leadVocalEnabled && styles.vocalToggleOn,
+              pressed && styles.vocalTogglePressed,
+            ]}
+            hitSlop={6}
+          >
+            <Text
+              style={[
+                styles.vocalToggleLabel,
+                leadVocalEnabled && styles.vocalToggleLabelOn,
+              ]}
+            >
+              {leadVocalEnabled ? '🎤 Lead vocal: ON' : '🎤 Lead vocal: off'}
+            </Text>
+          </Pressable>
         </View>
       )}
 
@@ -476,6 +506,31 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingTop: 4,
     paddingBottom: 8,
+  },
+  vocalToggle: {
+    alignSelf: 'flex-end',
+    marginTop: 8,
+    marginRight: 0,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  vocalToggleOn: {
+    backgroundColor: COLORS.black,
+  },
+  vocalTogglePressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  vocalToggleLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 11,
+    letterSpacing: -0.2,
+    color: COLORS.black,
+  },
+  vocalToggleLabelOn: {
+    color: COLORS.white,
   },
   lyricStrip: {
     paddingHorizontal: 16,
