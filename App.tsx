@@ -63,8 +63,25 @@ export default function App() {
 
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const currentHash = window.location.hash.replace(/^#/, '');
+    // Don't clobber Supabase's auth callback hash. After clicking a magic
+    // link, the URL is `#access_token=…&refresh_token=…&…`; supabase-js
+    // parses that asynchronously inside `detectSessionInUrl`. If we
+    // pushState our route hash before that parse finishes, the tokens
+    // are lost and the user gets bounced back to the sign-in screen.
+    // Once supabase consumes the hash it calls history.replaceState
+    // to clear it, and we'll start syncing routes normally on the
+    // next route change.
+    if (
+      currentHash.includes('access_token=') ||
+      currentHash.includes('refresh_token=') ||
+      currentHash.startsWith('error=') ||
+      currentHash.includes('&error=')
+    ) {
+      return;
+    }
     const path = routeToPath(route);
-    const current = window.location.hash.replace(/^#/, '') || '/';
+    const current = currentHash || '/';
     if (path !== current) {
       window.history.pushState({}, '', `#${path}`);
     }

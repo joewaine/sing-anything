@@ -45,5 +45,17 @@ export function pathToRoute(raw: string): Route | null {
 
 export function currentHashRoute(): Route | null {
   if (typeof window === 'undefined') return null;
+  const hash = window.location.hash.replace(/^#/, '');
+  // Supabase's auth callback puts `access_token=…&…` directly after the `#`.
+  // Don't try to parse that as a route — the user just landed from a magic
+  // link and we should stay on whatever the default is until supabase
+  // finishes consuming the tokens.
+  if (
+    hash.includes('access_token=') ||
+    hash.includes('refresh_token=') ||
+    hash.startsWith('error=')
+  ) {
+    return null;
+  }
   return pathToRoute(window.location.hash);
 }
