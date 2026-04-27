@@ -56,6 +56,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const playbackRef = useRef<Audio.Sound | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
   const countInRef = useRef<CountInHandle | null>(null);
+  // Set true the moment the screen unmounts. Async paths that create
+  // audio handles (phraseLoop, Audio.Sound) check this after their
+  // awaits — if the user has already navigated away, dispose the
+  // newly-created handle instead of stashing it. Without this guard,
+  // a race between stopRecording's async startDonePlayback and a
+  // back-navigation left the loop + sound running on a dead screen.
+  const unmountedRef = useRef(false);
   const [countdown, setCountdown] = useState(0);
 
   const revokeLastRecording = useCallback(() => {
@@ -128,12 +135,25 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         currentMsRef.current = ms;
       },
     });
+    if (unmountedRef.current) {
+      handle?.stop();
+      return null;
+    }
     if (!handle) {
       setErrorMsg('Audio not available on this device');
       setStage('error');
       return null;
     }
     phraseLoopRef.current = handle;
+    // Re-sync to the LATEST settings in case the user toggled or
+    // adjusted volume during startPhraseLoop's await window. The
+    // toggle useEffects fire on state change, but if phraseLoopRef
+    // was still null at that moment they no-op'd — so we re-apply
+    // here once the handle exists.
+    const latest = settingsRef.current;
+    handle.setBackingEnabled(latest.backingEnabled);
+    handle.setBackingVolume(latest.backingVolume);
+    handle.setVocalsEnabled(latest.leadVocalEnabled);
     return handle;
   }, [phrase]);
 
@@ -165,10 +185,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, [phrase, startLoopFromZero]);
 
   useEffect(() => {
+    unmountedRef.current = false;
     void startInitialLoop();
     return () => {
+      unmountedRef.current = true;
       teardown();
-      playbackRef.current?.unloadAsync();
+      playbackRef.current?.unloadAsync().catch(() => {});
+      playbackRef.current = null;
       revokeLastRecording();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -215,9 +238,23 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         currentMsRef.current = ms;
       },
     });
-    if (handle) phraseLoopRef.current = handle;
+    if (unmountedRef.current) {
+      handle?.stop();
+      return;
+    }
+    if (handle) {
+      phraseLoopRef.current = handle;
+      const latest = settingsRef.current;
+      handle.setBackingEnabled(latest.backingEnabled);
+      handle.setBackingVolume(latest.backingVolume);
+      handle.setVocalsEnabled(latest.leadVocalEnabled);
+    }
 
     const { sound } = await Audio.Sound.createAsync({ uri });
+    if (unmountedRef.current) {
+      sound.unloadAsync().catch(() => {});
+      return;
+    }
     playbackRef.current = sound;
     sound.playAsync().catch(() => {});
   }, [phrase]);

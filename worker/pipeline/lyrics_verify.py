@@ -171,11 +171,24 @@ def _align_canonical(
 
     matcher = difflib.SequenceMatcher(None, whisper_tokens, canon_tokens)
     ratio = matcher.ratio()
-    print(
-        f"[lyrics_verify] lrclib ratio={ratio:.2f} whisper={len(whisper_tokens)} "
-        f"canon={len(canon_tokens)}"
+    # whisper_match_rate = fraction of whisper's transcribed words that
+    # align cleanly to a canonical token. When whisper is sparse but
+    # accurate (got 3 of the 12 sung words right), the joint ratio
+    # comes out low (≈ 0.4 here) because canonical has many more
+    # words — but the 3 it found ARE correct anchors and the canonical
+    # merge would correctly insert the missing 9. Joint ratio alone
+    # would reject this; whisper_match_rate >= 0.6 lets it through.
+    matched = sum(
+        i2 - i1
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag == "equal"
     )
-    if ratio < LRCLIB_MIN_RATIO:
+    whisper_match_rate = matched / max(1, len(whisper_tokens))
+    print(
+        f"[lyrics_verify] lrclib ratio={ratio:.2f} whisper_match={whisper_match_rate:.2f} "
+        f"whisper={len(whisper_tokens)} canon={len(canon_tokens)}"
+    )
+    if ratio < LRCLIB_MIN_RATIO and whisper_match_rate < 0.6:
         return None, ratio
 
     out: list[dict] = []
@@ -244,32 +257,31 @@ def _align_canonical(
     return out, ratio
 
 
-def _claude_fetch(words: list[dict], song_name: str, artist: str | None) -> Optional[list[dict]]:
+def _claude_full_lyrics(song_name: str, artist: str | None) -> Optional[str]:
+    """Ask Claude for the full canonical lyrics of a song as plain text.
+    Used as a fallback when LRCLIB doesn't have the song. The plain
+    text is fed back through _align_canonical so missing words can be
+    inserted with interpolated timestamps — same code path as the
+    LRCLIB result. Earlier this function only returned a same-count
+    word list (preserving whisper's count), which meant whisper-missed
+    words could never be recovered through the Claude path.
+    """
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
 
     import httpx
 
-    whisper_text = " ".join(w["word"] for w in words).strip()
-    if not whisper_text:
-        return None
-
     song_desc = f"{song_name}" + (f" by {artist}" if artist else "")
 
     system = (
-        "You correct word-level transcription errors in sung lyrics. "
-        "Return JSON: {\"recognized\": bool, \"words\": string[]}. "
-        "If you know the song, return a corrected word list with the SAME "
-        "COUNT and ORDER as the input. Only change words that are clearly "
-        "wrong. Do not add or remove words. If you don't know the song, "
-        "set recognized=false and omit 'words'."
+        "Return the full canonical lyrics of the requested song as plain "
+        "text. One song line per text line. Do not include section "
+        "markers like [Verse] or [Chorus]. Do not include translations, "
+        "annotations, or commentary. If you don't know the song, "
+        "respond with the literal token UNKNOWN and nothing else."
     )
-    user = (
-        f"Song: {song_desc}\n\n"
-        f"WhisperX transcribed ({len(words)} words):\n{whisper_text}\n\n"
-        "Return JSON."
-    )
+    user = f"Song: {song_desc}\n\nReturn the lyrics as plain text."
 
     try:
         r = httpx.post(
@@ -281,7 +293,7 @@ def _claude_fetch(words: list[dict], song_name: str, artist: str | None) -> Opti
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
             },
@@ -292,19 +304,13 @@ def _claude_fetch(words: list[dict], song_name: str, artist: str | None) -> Opti
             return None
         blocks = (r.json() or {}).get("content") or []
         text = next((b.get("text", "") for b in blocks if b.get("type") == "text"), "")
-        # Extract JSON from Claude's text (may have surrounding prose)
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
+        text = text.strip()
+        if not text or text.upper().startswith("UNKNOWN"):
             return None
-        payload = json.loads(m.group(0))
-        if not payload.get("recognized"):
-            return None
-        new_words = payload.get("words")
-        if not isinstance(new_words, list) or len(new_words) != len(words):
-            print(f"[lyrics_verify] claude returned {len(new_words) if isinstance(new_words, list) else 'non-list'}"
-                  f" words vs whisper {len(words)}; ignoring")
-            return None
-        return [{**w, "word": str(nw).strip()} for w, nw in zip(words, new_words)]
+        # Sanity-cap: Claude shouldn't be returning a novel.
+        if len(text) > 16_000:
+            text = text[:16_000]
+        return text
     except Exception as e:
         print(f"[lyrics_verify] claude error: {e}")
         return None
@@ -333,12 +339,18 @@ def verify_lyrics(
             return aligned, "lrclib"
         if ratio >= LRCLIB_HIGH_CONFIDENCE:
             # LRCLIB has the song with high confidence but our matcher
-            # tripped on something — still skip Claude (it'd see the same
-            # whisper text and be tempted to over-correct).
+            # tripped on something — skip Claude rather than risk
+            # over-correcting on top of an already-good match.
             return words, "none"
 
-    claude_fixed = _claude_fetch(words, song_name, artist)
-    if claude_fixed is not None:
-        return claude_fixed, "claude"
+    # Claude fallback: get full canonical lyrics, run the same insert-
+    # capable alignment used for LRCLIB. Recovers words whisper missed
+    # for songs LRCLIB doesn't have (or doesn't have under that exact
+    # title/artist combination).
+    claude_lyrics = _claude_full_lyrics(song_name, artist)
+    if claude_lyrics:
+        aligned, _ = _align_canonical(words, claude_lyrics)
+        if aligned is not None:
+            return aligned, "claude"
 
     return words, "none"
