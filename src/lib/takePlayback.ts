@@ -76,27 +76,45 @@ export async function startTakePlayback(
   });
   if (!phraseHandle) return null;
 
-  // Pad/trim recording to loop length once, store buffer in closure
-  // for reuse on seek (we need to re-create the source each time).
+  // Pad/trim recording to loop length AND shift content right by the
+  // recording-time latency gap so playback syncs with the backing.
+  //
+  // During recording: recorder.start() fires at wall-clock R0 — mic
+  // captures from there. Backing was scheduled at ctx.currentTime +
+  // 0.05 and became audible at scheduled + outputLatency, so the
+  // first audible backing sample reached the user's ear ~0.05 +
+  // outputLatency seconds AFTER recording[0]. The user's voice in
+  // recording[t] is responding to backing[t - 0.05 - outputLatency].
+  // Without compensation, replay aligns recording[t] with backing[t]
+  // and the voice sounds ~150ms ahead of the music.
+  //
+  // Compensation: shift recording content right by HEAD_OFFSET in the
+  // aligned buffer. The first HEAD_OFFSET seconds become silence
+  // (zero-init); aligned[head..end] = recording[0..end-head]. Loop
+  // wraps preserve the offset because the silence is baked into the
+  // buffer itself, not just an initial start() offset.
+  const headOffsetSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
   let alignedRecording: AudioBuffer | null = null;
   if (recordingBuffer) {
     const targetLength = Math.max(
       1,
       Math.round(opts.loopDurationSec * recordingBuffer.sampleRate),
     );
-    if (recordingBuffer.length === targetLength) {
-      alignedRecording = recordingBuffer;
-    } else {
-      alignedRecording = ctx.createBuffer(
-        recordingBuffer.numberOfChannels,
-        targetLength,
-        recordingBuffer.sampleRate,
-      );
-      for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
-        const src = recordingBuffer.getChannelData(ch);
-        const dst = alignedRecording.getChannelData(ch);
-        const copyLen = Math.min(src.length, dst.length);
-        dst.set(src.subarray(0, copyLen), 0);
+    const headOffsetSamples = Math.max(
+      0,
+      Math.round(headOffsetSec * recordingBuffer.sampleRate),
+    );
+    alignedRecording = ctx.createBuffer(
+      recordingBuffer.numberOfChannels,
+      targetLength,
+      recordingBuffer.sampleRate,
+    );
+    for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
+      const src = recordingBuffer.getChannelData(ch);
+      const dst = alignedRecording.getChannelData(ch);
+      const copyLen = Math.min(src.length, targetLength - headOffsetSamples);
+      if (copyLen > 0) {
+        dst.set(src.subarray(0, copyLen), headOffsetSamples);
       }
     }
   }
