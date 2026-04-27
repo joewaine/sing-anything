@@ -22,6 +22,12 @@ export type PhraseLoopHandle = {
   getMsUntilNextLoop: () => number;
   /** Current position within the loop in ms (wraps mod loopDuration). */
   getPositionMs: () => number;
+  /** Seek to a position within the loop. Stops the current backing +
+   *  vocals sources and starts new ones at the corresponding buffer
+   *  offset. Returns the AudioContext anchor time the new sources were
+   *  scheduled at — callers (e.g. takePlayback) use this to schedule
+   *  sibling sources (the user's recording) at the same clock instant. */
+  seek: (positionMs: number) => number;
 };
 
 export type PhraseLoopOptions = {
@@ -104,29 +110,82 @@ export async function startPhraseLoop(
   let vocalsEnabled = opts.vocalsEnabled ?? true;
   const vocalsVolume = opts.vocalsVolume ?? 0.85;
 
-  let backingSource: AudioBufferSourceNode | null = null;
+  // Gain nodes live outside the source so seek() can recreate the
+  // sources without touching the gain — toggle state survives a seek.
   let backingGain: GainNode | null = null;
   if (backing) {
-    backingSource = ctx.createBufferSource();
-    backingSource.buffer = backing;
-    backingSource.loop = true;
     backingGain = ctx.createGain();
     backingGain.gain.value = backingEnabled ? backingVolume : 0;
-    backingSource.connect(backingGain).connect(ctx.destination);
-    backingSource.start(startAt, backingOffset);
+    backingGain.connect(ctx.destination);
   }
-
-  let vocalsSource: AudioBufferSourceNode | null = null;
   let vocalsGain: GainNode | null = null;
   if (vocals) {
-    vocalsSource = ctx.createBufferSource();
-    vocalsSource.buffer = vocals;
-    vocalsSource.loop = true;
     vocalsGain = ctx.createGain();
     vocalsGain.gain.value = vocalsEnabled ? vocalsVolume : 0;
-    vocalsSource.connect(vocalsGain).connect(ctx.destination);
-    // Vocals start at the moment backing wraps to position 0.
-    vocalsSource.start(phraseStartAt);
+    vocalsGain.connect(ctx.destination);
+  }
+
+  // Mutable phraseStartAt — seek() reanchors it so getPositionMs and
+  // onNextLoopStart stay correct after a jump.
+  let phraseAnchor = phraseStartAt;
+
+  let backingSource: AudioBufferSourceNode | null = null;
+  let vocalsSource: AudioBufferSourceNode | null = null;
+
+  // Schedule a new backing+vocals source pair at clockTime, with the
+  // backing buffer playing from `bufferOffset` and vocals from t=0.
+  // bufferOffset is normally `backingDur - leadInSec` for the lead-in
+  // start, or `position` for a seek.
+  const startSources = (
+    clockTime: number,
+    bOffset: number,
+    vOffset: number,
+  ) => {
+    if (backingSource) {
+      try { backingSource.stop(); } catch { /* already stopped */ }
+    }
+    if (vocalsSource) {
+      try { vocalsSource.stop(); } catch { /* already stopped */ }
+    }
+    if (backing && backingGain) {
+      const s = ctx.createBufferSource();
+      s.buffer = backing;
+      s.loop = true;
+      s.connect(backingGain);
+      s.start(clockTime, bOffset);
+      backingSource = s;
+    }
+    if (vocals && vocalsGain) {
+      const s = ctx.createBufferSource();
+      s.buffer = vocals;
+      s.loop = true;
+      s.connect(vocalsGain);
+      s.start(clockTime, vOffset);
+      vocalsSource = s;
+    }
+  };
+
+  // Initial start. Two scheduled clock times in play: backing starts
+  // at `startAt` (with offset = backingOffset to get the lead-in
+  // tail), vocals start at `phraseStartAt` so they enter when backing
+  // wraps to buffer t=0. When leadInSec=0 (the default since the
+  // worker bakes the lead-in into the audio file), startAt ===
+  // phraseStartAt and both fire together.
+  if (backing && backingGain) {
+    const s = ctx.createBufferSource();
+    s.buffer = backing;
+    s.loop = true;
+    s.connect(backingGain);
+    s.start(startAt, backingOffset);
+    backingSource = s;
+  }
+  if (vocals && vocalsGain) {
+    const s = ctx.createBufferSource();
+    s.buffer = vocals;
+    s.loop = true;
+    s.connect(vocalsGain);
+    s.start(phraseStartAt, 0);
+    vocalsSource = s;
   }
 
   const armedTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -148,10 +207,11 @@ export async function startPhraseLoop(
   const tick = () => {
     if (stopped) return;
     const audibleNow = ctx.currentTime - outputLatency;
-    // During the lead-in (audibleNow < phraseStartAt) we report 0 so
+    // During the lead-in (audibleNow < phraseAnchor) we report 0 so
     // the visual cursor sits at the start of the phrase. After the
-    // lead-in completes the position counts up modulo loopDur.
-    const elapsed = Math.max(0, audibleNow - phraseStartAt);
+    // lead-in completes (or after a seek) the position counts up
+    // modulo loopDur from phraseAnchor.
+    const elapsed = Math.max(0, audibleNow - phraseAnchor);
     const ms = (((elapsed % loopDur) + loopDur) % loopDur) * 1000;
     opts.onPositionMs?.(ms);
     rafId = requestAnimationFrame(tick);
@@ -187,13 +247,30 @@ export async function startPhraseLoop(
       vocalsEnabled = enabled;
       if (vocalsGain) ramp(vocalsGain, enabled ? vocalsVolume : 0);
     },
+    seek(positionMs) {
+      const positionSec = Math.max(
+        0,
+        Math.min(loopDur, positionMs / 1000),
+      );
+      const newClock = ctx.currentTime + 0.02;
+      // When seeking, both sources play from positionSec — no lead-in
+      // (the lead-in is a one-time intro, not a per-seek behaviour).
+      startSources(newClock, positionSec, positionSec);
+      // Anchor adjust: at clockTime newClock, audible position should
+      // be positionSec. We want elapsed = audibleNow - phraseAnchor =
+      // positionSec at audibleNow = newClock - outputLatency, so
+      // phraseAnchor = newClock - outputLatency - positionSec. For
+      // simplicity we pretend audibleNow ≈ newClock (the few-ms gap
+      // between scheduled and audible is irrelevant for the slider).
+      phraseAnchor = newClock - positionSec;
+      return newClock;
+    },
     onNextLoopStart(cb) {
-      // Loop boundaries are at phraseStartAt + N*loopDur (the lead-in
-      // happens once at the very start; subsequent wraps are at the
-      // phrase's t=0).
-      const elapsed = ctx.currentTime - phraseStartAt;
+      // Loop boundaries are at phraseAnchor + N*loopDur. Lead-in
+      // happens once before phraseAnchor; seek re-anchors it.
+      const elapsed = ctx.currentTime - phraseAnchor;
       const completedLoops = Math.max(0, Math.floor(elapsed / loopDur));
-      const nextLoopAt = phraseStartAt + (completedLoops + 1) * loopDur;
+      const nextLoopAt = phraseAnchor + (completedLoops + 1) * loopDur;
       const delayMs = Math.max(0, (nextLoopAt - ctx.currentTime) * 1000);
       let cancelled = false;
       const timer = setTimeout(() => {
@@ -208,13 +285,13 @@ export async function startPhraseLoop(
       };
     },
     getMsUntilNextLoop() {
-      const elapsed = ctx.currentTime - phraseStartAt;
+      const elapsed = ctx.currentTime - phraseAnchor;
       const completedLoops = Math.max(0, Math.floor(elapsed / loopDur));
-      const nextLoopAt = phraseStartAt + (completedLoops + 1) * loopDur;
+      const nextLoopAt = phraseAnchor + (completedLoops + 1) * loopDur;
       return Math.max(0, (nextLoopAt - ctx.currentTime) * 1000);
     },
     getPositionMs() {
-      const elapsed = Math.max(0, ctx.currentTime - phraseStartAt);
+      const elapsed = Math.max(0, ctx.currentTime - phraseAnchor);
       return (((elapsed % loopDur) + loopDur) % loopDur) * 1000;
     },
   };

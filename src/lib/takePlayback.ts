@@ -12,6 +12,13 @@ export type TakePlaybackHandle = {
   setBackingEnabled: (enabled: boolean) => void;
   setVocalsEnabled: (enabled: boolean) => void;
   setTakeEnabled: (enabled: boolean) => void;
+  /** Seek to a position within the loop. All three sources jump in
+   *  lockstep so backing/vocals/your take stay sample-aligned. */
+  seek: (positionMs: number) => void;
+  /** Read the current loop position in ms (wraps mod loopDurationSec). */
+  getPositionMs: () => number;
+  /** Total loop duration in ms — useful for sizing a slider track. */
+  getDurationMs: () => number;
 };
 
 export type TakePlaybackOptions = {
@@ -69,38 +76,58 @@ export async function startTakePlayback(
   });
   if (!phraseHandle) return null;
 
-  let takeSource: AudioBufferSourceNode | null = null;
-  let takeGain: GainNode | null = null;
+  // Pad/trim recording to loop length once, store buffer in closure
+  // for reuse on seek (we need to re-create the source each time).
+  let alignedRecording: AudioBuffer | null = null;
   if (recordingBuffer) {
-    // Pad/trim to loopDurationSec so the recording wraps on the same
-    // boundary as the phrase loop. Shorter takes get silent tail;
-    // longer takes get trimmed (last loop's worth is dropped).
     const targetLength = Math.max(
       1,
       Math.round(opts.loopDurationSec * recordingBuffer.sampleRate),
     );
-    let aligned: AudioBuffer = recordingBuffer;
-    if (recordingBuffer.length !== targetLength) {
-      aligned = ctx.createBuffer(
+    if (recordingBuffer.length === targetLength) {
+      alignedRecording = recordingBuffer;
+    } else {
+      alignedRecording = ctx.createBuffer(
         recordingBuffer.numberOfChannels,
         targetLength,
         recordingBuffer.sampleRate,
       );
       for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
         const src = recordingBuffer.getChannelData(ch);
-        const dst = aligned.getChannelData(ch);
+        const dst = alignedRecording.getChannelData(ch);
         const copyLen = Math.min(src.length, dst.length);
         dst.set(src.subarray(0, copyLen), 0);
       }
     }
-    takeSource = ctx.createBufferSource();
-    takeSource.buffer = aligned;
-    takeSource.loop = true;
+  }
+
+  // Take's gain lives outside the source — survives seek so toggle
+  // state doesn't reset when the user drags the scrubber.
+  let takeGain: GainNode | null = null;
+  if (alignedRecording) {
     takeGain = ctx.createGain();
     takeGain.gain.value = opts.takeEnabled !== false ? 1.0 : 0;
-    takeSource.connect(takeGain).connect(ctx.destination);
-    takeSource.start(commonStartAt);
+    takeGain.connect(ctx.destination);
   }
+
+  let takeSource: AudioBufferSourceNode | null = null;
+  const startTakeSource = (clockTime: number, offsetSec: number) => {
+    if (!alignedRecording || !takeGain) return;
+    if (takeSource) {
+      try {
+        takeSource.stop();
+      } catch {
+        // already stopped
+      }
+    }
+    const s = ctx.createBufferSource();
+    s.buffer = alignedRecording;
+    s.loop = true;
+    s.connect(takeGain);
+    s.start(clockTime, offsetSec);
+    takeSource = s;
+  };
+  startTakeSource(commonStartAt, 0);
 
   let stopped = false;
 
@@ -129,5 +156,19 @@ export async function startTakePlayback(
     setTakeEnabled: (b) => {
       if (takeGain) ramp(takeGain, b ? 1.0 : 0);
     },
+    seek(positionMs) {
+      if (stopped) return;
+      // Phrase loop seeks first; it returns the AudioContext anchor it
+      // chose. We schedule the take source at the same instant so all
+      // three sources land sample-aligned at the new position.
+      const newAnchor = phraseHandle.seek(positionMs);
+      const positionSec = Math.max(
+        0,
+        Math.min(opts.loopDurationSec, positionMs / 1000),
+      );
+      startTakeSource(newAnchor, positionSec);
+    },
+    getPositionMs: () => phraseHandle.getPositionMs(),
+    getDurationMs: () => opts.loopDurationSec * 1000,
   };
 }

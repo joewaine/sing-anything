@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { createElement, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -141,12 +142,19 @@ function TakeRowView({
   const [backing, setBacking] = useState(true);
   const [vocals, setVocals] = useState(true);
   const [take_, setTake] = useState(true);
+  // Scrubber position. Updated from the playback handle's tick at
+  // ~10Hz to keep state churn down; on drag we override locally and
+  // call seek().
+  const [positionMs, setPositionMs] = useState(0);
+  const [draggingSeek, setDraggingSeek] = useState<number | null>(null);
 
   useEffect(() => {
     if (!isActive) {
       setBacking(true);
       setVocals(true);
       setTake(true);
+      setPositionMs(0);
+      setDraggingSeek(null);
     }
   }, [isActive]);
 
@@ -159,6 +167,18 @@ function TakeRowView({
   useEffect(() => {
     handle?.setTakeEnabled(take_);
   }, [take_, handle]);
+
+  // Poll handle.getPositionMs at ~10Hz while active. Cheaper than
+  // a 60Hz callback and the slider's eye doesn't notice the seam.
+  useEffect(() => {
+    if (!isActive || !handle) return;
+    const id = setInterval(() => {
+      if (draggingSeek === null) {
+        setPositionMs(handle.getPositionMs());
+      }
+    }, 100);
+    return () => clearInterval(id);
+  }, [isActive, handle, draggingSeek]);
 
   const pa = take.pitch_analysis;
   const pct =
@@ -200,24 +220,88 @@ function TakeRowView({
         )}
       </View>
       {isActive && (
-        <View style={styles.toggleRow}>
-          <ToggleChip
-            label="Backing"
-            enabled={backing}
-            onToggle={() => setBacking((v) => !v)}
+        <>
+          <Scrubber
+            positionMs={draggingSeek ?? positionMs}
+            durationMs={take.phrase.duration_ms}
+            onScrubStart={(ms) => setDraggingSeek(ms)}
+            onScrubMove={(ms) => setDraggingSeek(ms)}
+            onScrubEnd={(ms) => {
+              setDraggingSeek(null);
+              setPositionMs(ms);
+              handle?.seek(ms);
+            }}
           />
-          <ToggleChip
-            label="Lead vocal"
-            enabled={vocals}
-            onToggle={() => setVocals((v) => !v)}
-          />
-          <ToggleChip
-            label="Your take"
-            enabled={take_}
-            onToggle={() => setTake((v) => !v)}
-          />
-        </View>
+          <View style={styles.toggleRow}>
+            <ToggleChip
+              label="Backing"
+              enabled={backing}
+              onToggle={() => setBacking((v) => !v)}
+            />
+            <ToggleChip
+              label="Lead vocal"
+              enabled={vocals}
+              onToggle={() => setVocals((v) => !v)}
+            />
+            <ToggleChip
+              label="Your take"
+              enabled={take_}
+              onToggle={() => setTake((v) => !v)}
+            />
+          </View>
+        </>
       )}
+    </View>
+  );
+}
+
+function Scrubber({
+  positionMs,
+  durationMs,
+  onScrubStart,
+  onScrubMove,
+  onScrubEnd,
+}: {
+  positionMs: number;
+  durationMs: number;
+  onScrubStart: (ms: number) => void;
+  onScrubMove: (ms: number) => void;
+  onScrubEnd: (ms: number) => void;
+}) {
+  // Web only — uses native <input type="range">. On native this is
+  // a no-op; would need react-native-community/slider.
+  if (Platform.OS !== 'web') return null;
+
+  const fmt = (ms: number) => {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${r.toString().padStart(2, '0')}`;
+  };
+
+  const inputEl = createElement('input', {
+    type: 'range',
+    min: 0,
+    max: Math.max(1, Math.round(durationMs)),
+    step: 50,
+    value: Math.round(positionMs),
+    onMouseDown: (e: any) => onScrubStart(Number(e.target.value)),
+    onTouchStart: (e: any) => onScrubStart(Number(e.target.value)),
+    onChange: (e: any) => onScrubMove(Number(e.target.value)),
+    onMouseUp: (e: any) => onScrubEnd(Number(e.target.value)),
+    onTouchEnd: (e: any) => onScrubEnd(Number(e.target.value)),
+    style: {
+      width: '100%',
+      accentColor: '#000',
+      cursor: 'pointer',
+    },
+  });
+
+  return (
+    <View style={styles.scrubberRow}>
+      <Text style={styles.scrubberTime}>{fmt(positionMs)}</Text>
+      <View style={styles.scrubberFlex}>{inputEl}</View>
+      <Text style={styles.scrubberTime}>{fmt(durationMs)}</Text>
     </View>
   );
 }
@@ -324,6 +408,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
+  },
+  scrubberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 4,
+  },
+  scrubberFlex: { flex: 1 },
+  scrubberTime: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.black,
+    minWidth: 36,
+    textAlign: 'center',
   },
   chip: {
     paddingHorizontal: 10,
