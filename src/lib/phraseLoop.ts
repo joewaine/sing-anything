@@ -99,9 +99,22 @@ export async function startPhraseLoop(
   let stopped = false;
   let rafId: number | null = null;
 
+  // Output latency (in seconds) — the gap between when audio is
+  // scheduled on the AudioContext and when it actually leaves the
+  // speakers. On macOS Chrome this is typically 30–100 ms. The visual
+  // cursor reads `ctx.currentTime` for "now", which is scheduled time;
+  // without this subtraction the pitch ribbon and lyric strip would
+  // lead the audio by exactly that much. Read once at startup — it's
+  // effectively constant per device + driver state.
+  const outputLatency =
+    typeof ctx.outputLatency === 'number' && Number.isFinite(ctx.outputLatency)
+      ? ctx.outputLatency
+      : 0;
+
   const tick = () => {
     if (stopped) return;
-    const elapsed = ctx.currentTime - startAt;
+    const audibleNow = ctx.currentTime - outputLatency;
+    const elapsed = Math.max(0, audibleNow - startAt);
     const ms = (((elapsed % loopDur) + loopDur) % loopDur) * 1000;
     opts.onPositionMs?.(ms);
     rafId = requestAnimationFrame(tick);

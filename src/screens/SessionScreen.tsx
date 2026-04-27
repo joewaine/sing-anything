@@ -6,24 +6,24 @@ import PitchRibbon from '../components/PitchRibbon';
 import LyricStrip from '../components/LyricStrip';
 import WaveformCanvas from '../components/WaveformCanvas';
 import RetroButton from '../components/RetroButton';
-import BeatBall from '../components/BeatBall';
 import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
 import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/feedback';
 import { createRecorder, primeMicPermission, type Recorder } from '../lib/recorder';
 import { startPhraseLoop, type PhraseLoopHandle } from '../lib/phraseLoop';
+import { startCountIn, type CountInHandle } from '../lib/countInClicks';
 import type { PitchAnalysis } from '../lib/pitch';
 import { useBackingVolume, nextStep } from '../lib/backingVolume';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 // Stages:
 //   loading — phrase audio buffers warming, screen first mounts
-//   playing — loop running; user can toggle audio + arm recording
-//   armed   — user pressed Record; recording will start at next loop t=0
-//   recording — capturing mic audio; auto-stops at end of one full loop
+//   playing — loop running; user can toggle audio + start recording
+//   countdown — 4-beat metronome before recording, loop paused
+//   recording — capturing mic audio; ends only on Stop
 //   done    — analysis + feedback view; loop is paused for focus
 //   error
-type Stage = 'loading' | 'playing' | 'armed' | 'recording' | 'done' | 'error';
+type Stage = 'loading' | 'playing' | 'countdown' | 'recording' | 'done' | 'error';
 
 type Props = {
   phrase: PhraseWithSong;
@@ -33,7 +33,7 @@ type Props = {
 const STAGE_LABELS: Record<Exclude<Stage, 'error'>, string> = {
   loading: 'Loading',
   playing: 'Playing',
-  armed: 'Armed',
+  countdown: 'Count in',
   recording: 'Recording',
   done: 'Done',
 };
@@ -49,30 +49,14 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
   const [backingEnabled, setBackingEnabled] = useState(true);
   const [backingVolume, setBackingVolume] = useBackingVolume();
-  // armCountdownMs is the seconds-until-record-starts shown while armed.
-  // Updated from a single rAF tick so it stays in step with the loop.
-  const [armCountdownMs, setArmCountdownMs] = useState(0);
-  // currentMs lives in a ref so frame-rate updates don't re-render the screen.
-  // PitchRibbon / LyricStrip / WaveformCanvas read it imperatively via rAF.
   const currentMsRef = useRef(0);
 
   const phraseLoopRef = useRef<PhraseLoopHandle | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const playbackRef = useRef<Audio.Sound | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
-  // Cancellable schedules — both call setTimeouts under the hood. Storing
-  // them lets us tear down on cancel/unmount without leaking the timer.
-  const cancelArmRef = useRef<(() => void) | null>(null);
-  const cancelStopArmRef = useRef<(() => void) | null>(null);
-  const armRafRef = useRef<number | null>(null);
-  const stopRecordingRef = useRef<() => Promise<void>>(() => Promise.resolve());
-
-  const stopArmRaf = useCallback(() => {
-    if (armRafRef.current !== null) {
-      cancelAnimationFrame(armRafRef.current);
-      armRafRef.current = null;
-    }
-  }, []);
+  const countInRef = useRef<CountInHandle | null>(null);
+  const [countdown, setCountdown] = useState(0);
 
   const revokeLastRecording = useCallback(() => {
     const uri = lastRecordingUriRef.current;
@@ -99,62 +83,56 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, []);
 
   const teardown = useCallback(() => {
-    cancelArmRef.current?.();
-    cancelArmRef.current = null;
-    cancelStopArmRef.current?.();
-    cancelStopArmRef.current = null;
-    stopArmRaf();
+    countInRef.current?.stop();
+    countInRef.current = null;
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
     recorderRef.current?.stop().catch(() => {});
     recorderRef.current = null;
     setMicStream(null);
-  }, [stopArmRaf]);
+  }, []);
 
-  // Mount: configure audio mode + kick off the loop. Auto-start avoids the
-  // "Tap to begin" gate the old Listen flow had — phrase audio plays from
-  // the moment the user lands here.
-  const startLoop = useCallback(async () => {
+  const startLoopFromZero = useCallback(async () => {
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
+    const handle = await startPhraseLoop({
+      backingUrl: phrase.backing_url,
+      vocalsUrl: phrase.vocals_url,
+      loopDurationSec: phrase.duration_ms / 1000,
+      backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
+      vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
+      backingEnabled,
+      backingVolume,
+      vocalsEnabled: leadVocalEnabled,
+      onPositionMs: (ms) => {
+        currentMsRef.current = ms;
+      },
+    });
+    if (!handle) {
+      setErrorMsg('Audio not available on this device');
+      setStage('error');
+      return null;
+    }
+    phraseLoopRef.current = handle;
+    return handle;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phrase]);
+
+  const startInitialLoop = useCallback(async () => {
     Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
     });
     primeMicPermission().catch(() => {
-      // Permission not granted yet — recorder.prepare() will surface a
-      // friendly error if Record is pressed before access is allowed.
+      // Permission not granted yet — recorder.prepare() will surface
+      // a friendly error if Record is pressed before access is allowed.
     });
-    try {
-      const handle = await startPhraseLoop({
-        backingUrl: phrase.backing_url,
-        vocalsUrl: phrase.vocals_url,
-        loopDurationSec: phrase.duration_ms / 1000,
-        backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
-        vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
-        backingEnabled,
-        backingVolume,
-        vocalsEnabled: leadVocalEnabled,
-        onPositionMs: (ms) => {
-          currentMsRef.current = ms;
-        },
-      });
-      if (!handle) {
-        setErrorMsg('Audio not available on this device');
-        setStage('error');
-        return;
-      }
-      phraseLoopRef.current = handle;
-      setStage('playing');
-    } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-      setStage('error');
-    }
-    // backingEnabled / backingVolume / leadVocalEnabled captured at mount;
-    // toggle effects below propagate later changes to the live handle.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phrase]);
+    const handle = await startLoopFromZero();
+    if (handle) setStage('playing');
+  }, [startLoopFromZero]);
 
   useEffect(() => {
-    void startLoop();
+    void startInitialLoop();
     return () => {
       teardown();
       playbackRef.current?.unloadAsync();
@@ -176,10 +154,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, [leadVocalEnabled]);
 
   const stopRecording = useCallback(async () => {
-    cancelStopArmRef.current?.();
-    cancelStopArmRef.current = null;
-    stopArmRaf();
-
     const recorder = recorderRef.current;
     if (!recorder) return;
 
@@ -205,9 +179,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     // feedback and replaying their own take, not practicing again yet.
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
-
-    // Snap currentMs to the end of the phrase so the ribbon shows the
-    // full take you just sang.
     currentMsRef.current = phrase.duration_ms;
 
     setStage('done');
@@ -235,60 +206,65 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase, stopArmRaf]);
+  }, [phrase]);
 
-  useEffect(() => {
-    stopRecordingRef.current = stopRecording;
-  }, [stopRecording]);
-
-  const armRecording = useCallback(async () => {
-    const handle = phraseLoopRef.current;
-    if (!handle) return;
-    setStage('armed');
-
+  const startRecording = useCallback(async () => {
     if (!recorderRef.current) {
       recorderRef.current = createRecorder();
     }
     const recorder = recorderRef.current;
-    // Open the mic in parallel with waiting for the next loop boundary.
-    // On Android this may briefly degrade backing audio quality (the OS
-    // flips into VOICE_COMMUNICATION mode); on iOS / macOS no effect.
-    const preparePromise = recorder.prepare().catch((e) => {
+
+    try {
+      await recorder.prepare();
+    } catch (e) {
       console.warn('recorder prepare failed:', e);
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+      setStage('error');
+      return;
+    }
+
+    // Pause the loop while we count in — the metronome clicks need the
+    // foreground, and the loop will restart from t=0 right after.
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
+    currentMsRef.current = 0;
+
+    setStage('countdown');
+    setCountdown(4);
+
+    const bpm = phrase.tempo_bpm ?? 120;
+    countInRef.current = startCountIn({
+      bpm,
+      beats: 4,
+      onBeat: (n) => {
+        // n is 1..4 — display as 4..3..2..1 so the user sees a
+        // descending count.
+        setCountdown(5 - n);
+      },
+      onComplete: async () => {
+        countInRef.current = null;
+        // Loop restarts from t=0 + recording starts simultaneously.
+        // Pitch analysis can index against phrase notes directly.
+        const handle = await startLoopFromZero();
+        if (!handle) return;
+        setStage('recording');
+        recorder.start().catch((e) =>
+          console.warn('recorder start failed:', e),
+        );
+        setMicStream(recorder.getStream());
+      },
     });
+  }, [phrase, startLoopFromZero]);
 
-    cancelArmRef.current = handle.onNextLoopStart(async () => {
-      cancelArmRef.current = null;
-      stopArmRaf();
-      await preparePromise;
-      setStage('recording');
-      recorder.start().catch((e) => {
-        console.warn('recorder start failed:', e);
-      });
-      setMicStream(recorder.getStream());
-      // Auto-stop at the end of this loop — one full take.
-      cancelStopArmRef.current = phraseLoopRef.current?.onNextLoopStart(() => {
-        cancelStopArmRef.current = null;
-        void stopRecordingRef.current();
-      }) ?? null;
-    });
-
-    // Drive the "Starts in X.Xs" countdown.
-    const tick = () => {
-      const ms = phraseLoopRef.current?.getMsUntilNextLoop() ?? 0;
-      setArmCountdownMs(ms);
-      armRafRef.current = requestAnimationFrame(tick);
-    };
-    armRafRef.current = requestAnimationFrame(tick);
-  }, [stopArmRaf]);
-
-  const cancelArm = useCallback(() => {
-    cancelArmRef.current?.();
-    cancelArmRef.current = null;
-    stopArmRaf();
-    setArmCountdownMs(0);
-    setStage('playing');
-  }, [stopArmRaf]);
+  const cancelCountIn = useCallback(() => {
+    countInRef.current?.stop();
+    countInRef.current = null;
+    setCountdown(0);
+    void (async () => {
+      const handle = await startLoopFromZero();
+      if (handle) setStage('playing');
+    })();
+  }, [startLoopFromZero]);
 
   const replayTake = useCallback(async () => {
     let sound = playbackRef.current;
@@ -318,12 +294,12 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     revokeLastRecording();
     currentMsRef.current = 0;
     setStage('loading');
-    await startLoop();
-  }, [revokeLastRecording, startLoop]);
+    await startInitialLoop();
+  }, [revokeLastRecording, startInitialLoop]);
 
-  const loopRunning =
-    stage === 'playing' || stage === 'armed' || stage === 'recording';
-  const showRibbon = loopRunning || stage === 'done';
+  const loopRunning = stage === 'playing' || stage === 'recording';
+  const showRibbon =
+    loopRunning || stage === 'done' || stage === 'countdown';
 
   return (
     <Chrome>
@@ -384,24 +360,21 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         {stage === 'loading' && (
           <Text style={styles.savedLabel}>LOADING…</Text>
         )}
-        {(stage === 'playing' || stage === 'armed' || stage === 'recording') && (
+        {stage === 'countdown' && (
           <View style={styles.liveControls}>
-            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
+            <Text style={styles.countdownNum}>{countdown || ' '}</Text>
+            <RetroButton label="Cancel" onPress={cancelCountIn} size="md" />
+          </View>
+        )}
+        {(stage === 'playing' || stage === 'recording') && (
+          <View style={styles.liveControls}>
             {stage === 'playing' && (
               <RetroButton
                 label="● Record"
-                onPress={armRecording}
+                onPress={startRecording}
                 variant="danger"
                 size="lg"
               />
-            )}
-            {stage === 'armed' && (
-              <View style={styles.armRow}>
-                <Text style={styles.armLabel}>
-                  STARTS IN {(armCountdownMs / 1000).toFixed(1)}s
-                </Text>
-                <RetroButton label="Cancel" onPress={cancelArm} size="md" />
-              </View>
             )}
             {stage === 'recording' && (
               <RetroButton
@@ -454,7 +427,7 @@ function StageIndicator({ stage }: { stage: Stage }) {
   const order: Array<Exclude<Stage, 'error'>> = [
     'loading',
     'playing',
-    'armed',
+    'countdown',
     'recording',
     'done',
   ];
@@ -701,16 +674,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  armRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  armLabel: {
-    fontFamily: FONTS.chicago,
-    fontWeight: '700',
-    fontSize: 14,
-    letterSpacing: 1,
+  countdownNum: {
+    fontFamily: FONTS.pixel,
+    fontSize: 96,
+    lineHeight: 96,
     color: COLORS.black,
   },
   toggleRow: {
