@@ -4,6 +4,66 @@ import { analyzeAttempt, type PitchAnalysis } from './pitch';
 import type { MidiNote } from '../types';
 import type { PhraseWithSong } from './phrases';
 
+export type TakeRow = {
+  id: string;
+  phrase_id: string;
+  audio_path: string;
+  pitch_analysis: PitchAnalysis | null;
+  created_at: string;
+  phrase: {
+    id: string;
+    phrase_type: string;
+    duration_ms: number;
+    lyric_text: string | null;
+    tempo_bpm: number | null;
+    notes: MidiNote[];
+    vocals_path: string;
+    backing_path: string | null;
+    song_id: string;
+    song: {
+      id: string;
+      name: string;
+      artist: string | null;
+    };
+  };
+};
+
+export async function listAttempts(): Promise<TakeRow[]> {
+  const supabase = requireSupabase();
+  const { data, error } = await supabase
+    .from('attempts')
+    .select(
+      'id, phrase_id, audio_path, pitch_analysis, created_at, '
+        + 'phrase:phrases(id, phrase_type, duration_ms, lyric_text, tempo_bpm, '
+        + 'notes, vocals_path, backing_path, song_id, song:songs(id, name, artist))',
+    )
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) throw error;
+  return (data ?? []) as unknown as TakeRow[];
+}
+
+export async function signTakeUrls(take: TakeRow): Promise<{
+  recordingUrl: string;
+  vocalsUrl: string;
+  backingUrl: string | null;
+}> {
+  const supabase = requireSupabase();
+  const sign = async (bucket: string, path: string) => {
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(path, 60 * 60);
+    if (error) throw error;
+    return data.signedUrl;
+  };
+  const [recordingUrl, vocalsUrl, backingUrl] = await Promise.all([
+    sign('attempts', take.audio_path),
+    sign('phrases', take.phrase.vocals_path),
+    take.phrase.backing_path ? sign('phrases', take.phrase.backing_path) : null,
+  ]);
+  return { recordingUrl, vocalsUrl, backingUrl };
+}
+
 export type UploadResult = {
   attemptId: string;
   audioPath: string;

@@ -21,19 +21,24 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
   const [phraseType, setPhraseType] = useState<'verse' | 'line' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [wholeSong, setWholeSong] = useState<PhraseListRow | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     setPhrases(null);
     setPhraseType(null);
+    setWholeSong(null);
     setError(null);
     (async () => {
       try {
-        const [s, verses] = await Promise.all([
+        const [s, verses, wholeSongs] = await Promise.all([
           getSong(songId),
           listPhrases(songId, 'verse'),
+          listPhrases(songId, 'whole_song'),
         ]);
         if (cancelled) return;
         setSong(s);
+        setWholeSong(wholeSongs[0] ?? null);
         if (verses.length > 0) {
           setPhrases(verses);
           setPhraseType('verse');
@@ -87,6 +92,30 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
           </View>
         ) : (
           <>
+            {wholeSong && (
+              <>
+                <Pressable
+                  onPress={() => onPick(wholeSong)}
+                  style={({ pressed }) => [
+                    styles.wholeSongRow,
+                    pressed && styles.rowPressed,
+                  ]}
+                >
+                  <View style={styles.wholeSongIcon}>
+                    <Text style={styles.wholeSongIconText}>★</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.wholeSongLabel}>ENTIRE SONG</Text>
+                    <Text style={styles.rowMeta}>
+                      {(wholeSong.duration_ms / 1000).toFixed(0)}s · sing the whole thing
+                    </Text>
+                  </View>
+                  <Text style={styles.chevron}>▶</Text>
+                </Pressable>
+                <View style={styles.sep} />
+                <Text style={styles.sectionLabel}>OR PRACTICE A PIECE</Text>
+              </>
+            )}
             {phraseType === 'line' && (
               <Text style={styles.modeNote}>
                 This song is short — showing individual lines.
@@ -166,6 +195,47 @@ const styles = StyleSheet.create({
     fontFamily: FONTS.monaco,
     fontSize: 11,
     color: COLORS.softGrey,
+    marginBottom: 8,
+    paddingHorizontal: 6,
+  },
+  wholeSongRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 10,
+    backgroundColor: COLORS.black,
+    marginBottom: 12,
+    ...BORDER_1BIT,
+  },
+  wholeSongIcon: {
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.white,
+    ...BORDER_1BIT,
+  },
+  wholeSongIconText: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 16,
+    color: COLORS.black,
+  },
+  wholeSongLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 14,
+    letterSpacing: 1,
+    color: COLORS.white,
+  },
+  sectionLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 10,
+    letterSpacing: 2,
+    color: COLORS.softGrey,
+    marginTop: 8,
     marginBottom: 8,
     paddingHorizontal: 6,
   },

@@ -20,7 +20,7 @@ export type Song = {
   created_at: string;
 };
 
-export type PhraseType = 'line' | 'verse';
+export type PhraseType = 'line' | 'verse' | 'whole_song';
 
 export type Phrase = {
   id: string;

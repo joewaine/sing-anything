@@ -217,4 +217,41 @@ def detect_phrases(
         else:
             i += 1
 
-    return lines + verses
+    # Whole-song phrase: practice / sing-along to the entire track. The
+    # vocal stem itself is the "lyric_text", notes are the full song's
+    # quantized notes (already in absolute song-relative ms). No lead-in
+    # — the song begins from its own t=0, there's nothing earlier to
+    # pre-roll from.
+    sorted_words = sorted(words, key=lambda w: w["start"])
+    full_lyric = " ".join(w["word"] for w in sorted_words if w.get("word")).strip()
+    full_notes = [
+        {
+            "start_ms": int(n["start_ms"]),
+            "end_ms": int(n["end_ms"]),
+            "pitch_midi": int(n["pitch_midi"]),
+            "lyric": n.get("lyric", ""),
+        }
+        for n in notes
+    ]
+    try:
+        info = sf.info(str(vocals_path))
+        song_dur_ms = int(info.duration * 1000)
+    except Exception as e:
+        print(f"[phrases] failed to read song duration: {e}")
+        song_dur_ms = (
+            max((n["end_ms"] for n in notes), default=0)
+            if notes else 0
+        )
+    whole_song = {
+        "start_ms": 0,
+        "end_ms": song_dur_ms,
+        # clip_offset(0) = 0 (nothing earlier to clip from), so this
+        # matches the audio file ffmpeg actually emits.
+        "duration_ms": clip_duration(0, song_dur_ms),
+        "phrase_type": "whole_song",
+        "lyric_text": full_lyric,
+        "notes": full_notes,
+        "tempo_bpm": tempo_bpm,
+    }
+
+    return [whole_song] + lines + verses

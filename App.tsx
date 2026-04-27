@@ -6,6 +6,7 @@ import LibraryScreen from './src/screens/LibraryScreen';
 import PasskeyScreen from './src/screens/PasskeyScreen';
 import PickerScreen from './src/screens/PickerScreen';
 import SessionScreen from './src/screens/SessionScreen';
+import TakesScreen from './src/screens/TakesScreen';
 import UploadScreen from './src/screens/UploadScreen';
 import WelcomeScreen from './src/screens/WelcomeScreen';
 import { signOut } from './src/lib/passkey';
@@ -165,6 +166,7 @@ export default function App() {
         <LibraryScreen
           onUpload={() => setRoute({ screen: 'upload' })}
           onPickSong={(song) => setRoute({ screen: 'picker', songId: song.id })}
+          onYourTakes={() => setRoute({ screen: 'takes' })}
           onSignOut={() => {
             void signOut();
             // onAuthStateChange will fire SIGNED_OUT and flip `unlocked`,
@@ -172,6 +174,8 @@ export default function App() {
             setRoute({ screen: 'welcome' });
           }}
         />
+      ) : route.screen === 'takes' ? (
+        <TakesScreen onBack={() => setRoute({ screen: 'library' })} />
       ) : route.screen === 'upload' ? (
         <UploadScreen
           onBack={() => setRoute({ screen: 'library' })}
