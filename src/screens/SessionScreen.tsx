@@ -12,6 +12,7 @@ import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/
 import { createRecorder, primeMicPermission, type Recorder } from '../lib/recorder';
 import { startPhraseLoop, type PhraseLoopHandle } from '../lib/phraseLoop';
 import { startCountIn, type CountInHandle } from '../lib/countInClicks';
+import { getAudioContext } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
 import { useBackingVolume, nextStep } from '../lib/backingVolume';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
@@ -49,11 +50,21 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
   const [backingEnabled, setBackingEnabled] = useState(true);
   const [backingVolume, setBackingVolume] = useBackingVolume();
+  // Toggle for the user's own recorded take during done-view playback.
+  // Default on — the whole point of done view is hearing yourself.
+  const [yourTakeEnabled, setYourTakeEnabled] = useState(true);
   const currentMsRef = useRef(0);
 
   const phraseLoopRef = useRef<PhraseLoopHandle | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const playbackRef = useRef<Audio.Sound | null>(null);
+  // For done-view replay on web we play the recording through Web
+  // Audio (decoded into a buffer) so it shares the same clock as the
+  // backing loop — sample-accurate sync. Native still uses the
+  // playbackRef Audio.Sound path because expo-av has no shared clock
+  // with the Web Audio backing.
+  const recordingSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const recordingGainRef = useRef<GainNode | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
   const countInRef = useRef<CountInHandle | null>(null);
   // Set true the moment the screen unmounts. Async paths that create
@@ -89,15 +100,28 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
   }, []);
 
+  const stopRecordingSource = useCallback(() => {
+    const src = recordingSourceRef.current;
+    recordingSourceRef.current = null;
+    recordingGainRef.current = null;
+    if (!src) return;
+    try {
+      src.stop();
+    } catch {
+      // already stopped / not started
+    }
+  }, []);
+
   const teardown = useCallback(() => {
     countInRef.current?.stop();
     countInRef.current = null;
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
+    stopRecordingSource();
     recorderRef.current?.stop().catch(() => {});
     recorderRef.current = null;
     setMicStream(null);
-  }, []);
+  }, [stopRecordingSource]);
 
   // settingsRef mirrors the user's toggle/volume state. We can't read
   // state directly in startLoopFromZero — it's a useCallback whose
@@ -109,10 +133,16 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     backingEnabled,
     backingVolume,
     leadVocalEnabled,
+    yourTakeEnabled,
   });
   useEffect(() => {
-    settingsRef.current = { backingEnabled, backingVolume, leadVocalEnabled };
-  }, [backingEnabled, backingVolume, leadVocalEnabled]);
+    settingsRef.current = {
+      backingEnabled,
+      backingVolume,
+      leadVocalEnabled,
+      yourTakeEnabled,
+    };
+  }, [backingEnabled, backingVolume, leadVocalEnabled, yourTakeEnabled]);
 
   const startLoopFromZero = useCallback(async () => {
     phraseLoopRef.current?.stop();
@@ -208,21 +238,57 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   useEffect(() => {
     phraseLoopRef.current?.setVocalsEnabled(leadVocalEnabled);
   }, [leadVocalEnabled]);
+  // Your-take gain: ramped on the recording's GainNode in the same
+  // 30ms window phraseLoop uses, so the toggle feels consistent.
+  useEffect(() => {
+    const gain = recordingGainRef.current;
+    const ctx = getAudioContext();
+    if (!gain || !ctx) return;
+    const t = ctx.currentTime;
+    gain.gain.cancelScheduledValues(t);
+    gain.gain.setValueAtTime(gain.gain.value, t);
+    gain.gain.linearRampToValueAtTime(yourTakeEnabled ? 1.0 : 0, t + 0.03);
+  }, [yourTakeEnabled]);
 
   // Start (or restart) playback of the just-recorded take alongside a
-  // looping phrase backing track. Both anchor to ctx.currentTime so they
-  // stay roughly aligned for the duration of the take. Backing + lead
-  // vocal can be toggled in real time via the chips below — useful for
-  // listening to your voice against just the backing, or comparing
-  // your phrasing against the reference vocal.
+  // looping phrase backing track. On web both sources are scheduled at
+  // the SAME ctx.currentTime so they're sample-accurately aligned —
+  // backing/vocals + the user's recording all start together. The
+  // earlier path used expo-av's Audio.Sound for the recording, which
+  // ran on a separate clock from the Web Audio backing and drifted by
+  // the duration of the createAsync await (50–500ms).
   const startDonePlayback = useCallback(async () => {
     playbackRef.current?.unloadAsync().catch(() => {});
     playbackRef.current = null;
+    stopRecordingSource();
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
 
     const uri = lastRecordingUriRef.current;
     if (!uri) return;
+
+    const ctx = getAudioContext();
+    // Decode the recording in parallel with the phrase buffers so we
+    // can schedule both at one ctx.currentTime anchor. Web only —
+    // native fetch+decodeAudioData isn't available, so it falls
+    // through to the Audio.Sound path.
+    let recordingBuffer: AudioBuffer | null = null;
+    if (ctx) {
+      try {
+        const response = await fetch(uri);
+        const arrayBuffer = await response.arrayBuffer();
+        recordingBuffer = await ctx.decodeAudioData(arrayBuffer);
+      } catch (e) {
+        console.warn('[done] recording decode failed:', e);
+      }
+    }
+    if (unmountedRef.current) return;
+
+    // Common future timestamp for everything that follows. 0.1s gives
+    // startPhraseLoop (which itself awaits a buffer cache lookup) and
+    // the source.start scheduling enough headroom to not miss the
+    // window.
+    const commonStartAt = ctx ? ctx.currentTime + 0.1 : 0;
 
     const s = settingsRef.current;
     const handle = await startPhraseLoop({
@@ -234,6 +300,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       backingEnabled: s.backingEnabled,
       backingVolume: s.backingVolume,
       vocalsEnabled: s.leadVocalEnabled,
+      startAt: ctx ? commonStartAt : undefined,
       onPositionMs: (ms) => {
         currentMsRef.current = ms;
       },
@@ -250,14 +317,54 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       handle.setVocalsEnabled(latest.leadVocalEnabled);
     }
 
-    const { sound } = await Audio.Sound.createAsync({ uri });
-    if (unmountedRef.current) {
-      sound.unloadAsync().catch(() => {});
-      return;
+    if (ctx && recordingBuffer) {
+      // Web Audio path: schedule the recording at the same ctx time
+      // as the phrase loop and set loop=true on a buffer padded /
+      // trimmed to phrase duration. That way all three sources
+      // (backing, vocals, your take) wrap on the same boundary
+      // every loop iteration — sample-accurate stereo lockstep.
+      const phraseSec = phrase.duration_ms / 1000;
+      const targetLength = Math.max(
+        1,
+        Math.round(phraseSec * recordingBuffer.sampleRate),
+      );
+      let aligned: AudioBuffer = recordingBuffer;
+      if (recordingBuffer.length !== targetLength) {
+        aligned = ctx.createBuffer(
+          recordingBuffer.numberOfChannels,
+          targetLength,
+          recordingBuffer.sampleRate,
+        );
+        for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
+          const src = recordingBuffer.getChannelData(ch);
+          const dst = aligned.getChannelData(ch);
+          const copyLen = Math.min(src.length, dst.length);
+          dst.set(src.subarray(0, copyLen), 0);
+          // If recording was shorter, the tail stays as zero-init
+          // silence — fills out to the loop boundary.
+        }
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = aligned;
+      source.loop = true;
+      const gain = ctx.createGain();
+      gain.gain.value = settingsRef.current.yourTakeEnabled ? 1.0 : 0;
+      source.connect(gain).connect(ctx.destination);
+      source.start(commonStartAt);
+      recordingSourceRef.current = source;
+      recordingGainRef.current = gain;
+    } else {
+      // Native fallback: expo-av Audio.Sound. Drifts vs backing,
+      // but native doesn't share the Web Audio clock anyway.
+      const { sound } = await Audio.Sound.createAsync({ uri });
+      if (unmountedRef.current) {
+        sound.unloadAsync().catch(() => {});
+        return;
+      }
+      playbackRef.current = sound;
+      sound.playAsync().catch(() => {});
     }
-    playbackRef.current = sound;
-    sound.playAsync().catch(() => {});
-  }, [phrase]);
+  }, [phrase, stopRecordingSource]);
 
   const stopRecording = useCallback(async () => {
     const recorder = recorderRef.current;
@@ -504,6 +611,8 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             onToggleBacking={() => setBackingEnabled((v) => !v)}
             leadVocalEnabled={leadVocalEnabled}
             onToggleLeadVocal={() => setLeadVocalEnabled((v) => !v)}
+            yourTakeEnabled={yourTakeEnabled}
+            onToggleYourTake={() => setYourTakeEnabled((v) => !v)}
             backingVolume={backingVolume}
             onChangeBackingVolume={setBackingVolume}
           />
@@ -590,6 +699,8 @@ function DoneView({
   onToggleBacking,
   leadVocalEnabled,
   onToggleLeadVocal,
+  yourTakeEnabled,
+  onToggleYourTake,
   backingVolume,
   onChangeBackingVolume,
 }: {
@@ -603,6 +714,8 @@ function DoneView({
   onToggleBacking: () => void;
   leadVocalEnabled: boolean;
   onToggleLeadVocal: () => void;
+  yourTakeEnabled: boolean;
+  onToggleYourTake: () => void;
   backingVolume: number;
   onChangeBackingVolume: (v: number) => void;
 }) {
@@ -655,6 +768,11 @@ function DoneView({
           label="Lead vocal"
           enabled={leadVocalEnabled}
           onToggle={onToggleLeadVocal}
+        />
+        <ToggleChip
+          label="Your take"
+          enabled={yourTakeEnabled}
+          onToggle={onToggleYourTake}
         />
       </View>
       <BackingVolumeControl

@@ -42,6 +42,11 @@ export type PhraseLoopOptions = {
    *  with backing[0]. After the first wrap both sources stay locked
    *  in sync. 0 = no lead-in (start clean). */
   leadInSec?: number;
+  /** Override the AudioContext time at which the loop's sources start.
+   *  Used by the done-view replay path to schedule the phrase loop
+   *  and the user's recording at the same instant for sample-accurate
+   *  sync. If omitted, defaults to ctx.currentTime + 0.05. */
+  startAt?: number;
   onPositionMs?: (ms: number) => void;
 };
 
@@ -70,8 +75,10 @@ export async function startPhraseLoop(
 
   // Small offset so source.start(...) is in the future — required by the
   // Web Audio spec on some browsers, and gives the next-loop scheduler a
-  // stable anchor to count from.
-  const startAt = ctx.currentTime + 0.05;
+  // stable anchor to count from. Caller can override via opts.startAt
+  // when it needs to sync the phrase loop with another source (e.g.
+  // the user's recording during done-view replay).
+  const startAt = opts.startAt ?? ctx.currentTime + 0.05;
   const loopDur = Math.max(0.5, opts.loopDurationSec);
 
   // Lead-in: we want some backing-only audio to play before the vocal
