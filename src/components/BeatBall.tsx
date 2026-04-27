@@ -1,9 +1,8 @@
 // Bouncing-ball metronome.
-// Renders a small dot that hops up-and-down once per beat. The audio click
-// schedule (countIn.ts) is the timing authority — this is a visual cue that
-// trails the audio by a few ms at most. The animation runs as an Animated
-// loop on the JS thread; for one ball at ~120 BPM that's <1% of a frame
-// budget, no need for the native driver path.
+// Renders a small dot that hops up-and-down once per beat at the phrase
+// tempo. Visual cue only — the looping audio (phraseLoop.ts) is the
+// timing authority. The animation runs as an Animated loop on the JS
+// thread; for one ball at ~120 BPM that's <1% of a frame budget.
 
 import { useEffect, useRef } from 'react';
 import { Animated, StyleSheet, View } from 'react-native';

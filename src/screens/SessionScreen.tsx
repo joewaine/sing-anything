@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Audio, type AVPlaybackStatus } from 'expo-av';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Audio } from 'expo-av';
 import Chrome from '../components/Chrome';
 import PitchRibbon from '../components/PitchRibbon';
 import LyricStrip from '../components/LyricStrip';
@@ -11,19 +11,19 @@ import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
 import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/feedback';
 import { createRecorder, primeMicPermission, type Recorder } from '../lib/recorder';
-import { startCountInAndBacking, type CountInHandleWithVocals } from '../lib/countIn';
-import { prefetchBuffer } from '../lib/audioService';
+import { startPhraseLoop, type PhraseLoopHandle } from '../lib/phraseLoop';
 import type { PitchAnalysis } from '../lib/pitch';
 import { useBackingVolume, nextStep } from '../lib/backingVolume';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
-type Stage =
-  | 'idle'
-  | 'listening'
-  | 'countdown'
-  | 'recording'
-  | 'done'
-  | 'error';
+// Stages:
+//   loading — phrase audio buffers warming, screen first mounts
+//   playing — loop running; user can toggle audio + arm recording
+//   armed   — user pressed Record; recording will start at next loop t=0
+//   recording — capturing mic audio; auto-stops at end of one full loop
+//   done    — analysis + feedback view; loop is paused for focus
+//   error
+type Stage = 'loading' | 'playing' | 'armed' | 'recording' | 'done' | 'error';
 
 type Props = {
   phrase: PhraseWithSong;
@@ -31,50 +31,46 @@ type Props = {
 };
 
 const STAGE_LABELS: Record<Exclude<Stage, 'error'>, string> = {
-  idle: 'Ready',
-  listening: 'Listening…',
-  countdown: 'Count in',
+  loading: 'Loading',
+  playing: 'Playing',
+  armed: 'Armed',
   recording: 'Recording',
   done: 'Done',
 };
 
 export default function SessionScreen({ phrase, onBack }: Props) {
-  const [stage, setStage] = useState<Stage>('idle');
-  const [countdown, setCountdown] = useState(0);
+  const [stage, setStage] = useState<Stage>('loading');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<PitchAnalysis | null>(null);
   const [analysisPending, setAnalysisPending] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackResult | null>(null);
   const [feedbackPending, setFeedbackPending] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
-  // Default to ON — the lead vocal acts as a guide track during recording.
-  // User can mute mid-take via the toggle; the gain ramps to 0 without
-  // re-decoding or re-scheduling.
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
-  const [listenPaused, setListenPaused] = useState(false);
+  const [backingEnabled, setBackingEnabled] = useState(true);
   const [backingVolume, setBackingVolume] = useBackingVolume();
-  const [replaying, setReplaying] = useState(false);
+  // armCountdownMs is the seconds-until-record-starts shown while armed.
+  // Updated from a single rAF tick so it stays in step with the loop.
+  const [armCountdownMs, setArmCountdownMs] = useState(0);
   // currentMs lives in a ref so frame-rate updates don't re-render the screen.
-  // PitchRibbon reads it imperatively via rAF.
+  // PitchRibbon / LyricStrip / WaveformCanvas read it imperatively via rAF.
   const currentMsRef = useRef(0);
 
-  const referenceRef = useRef<Audio.Sound | null>(null);
+  const phraseLoopRef = useRef<PhraseLoopHandle | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
-  const countInRef = useRef<CountInHandleWithVocals | null>(null);
-  const listenClockRef = useRef<{
-    pause: () => void;
-    resume: () => void;
-    reset: () => void;
-  } | null>(null);
   const playbackRef = useRef<Audio.Sound | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
-  const listenRafRef = useRef<number | null>(null);
+  // Cancellable schedules — both call setTimeouts under the hood. Storing
+  // them lets us tear down on cancel/unmount without leaking the timer.
+  const cancelArmRef = useRef<(() => void) | null>(null);
+  const cancelStopArmRef = useRef<(() => void) | null>(null);
+  const armRafRef = useRef<number | null>(null);
   const stopRecordingRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
-  const stopListenTicker = useCallback(() => {
-    if (listenRafRef.current !== null) {
-      cancelAnimationFrame(listenRafRef.current);
-      listenRafRef.current = null;
+  const stopArmRaf = useCallback(() => {
+    if (armRafRef.current !== null) {
+      cancelAnimationFrame(armRafRef.current);
+      armRafRef.current = null;
     }
   }, []);
 
@@ -90,11 +86,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       URL.revokeObjectURL(uri);
       return;
     }
-    // Native: expo-av writes recordings to a file:// path inside the
-    // app's cache. Without explicit cleanup these accumulate ~2-3MB per
-    // attempt and can balloon a long practice session into hundreds of
-    // MB. Lazy-import so the web bundle doesn't carry expo-file-system
-    // for browsers that don't need it.
     if (uri.startsWith('file://')) {
       void (async () => {
         try {
@@ -107,40 +98,90 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
   }, []);
 
-  useEffect(() => {
+  const teardown = useCallback(() => {
+    cancelArmRef.current?.();
+    cancelArmRef.current = null;
+    cancelStopArmRef.current?.();
+    cancelStopArmRef.current = null;
+    stopArmRaf();
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
+    recorderRef.current?.stop().catch(() => {});
+    recorderRef.current = null;
+    setMicStream(null);
+  }, [stopArmRaf]);
+
+  // Mount: configure audio mode + kick off the loop. Auto-start avoids the
+  // "Tap to begin" gate the old Listen flow had — phrase audio plays from
+  // the moment the user lands here.
+  const startLoop = useCallback(async () => {
     Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
     });
+    primeMicPermission().catch(() => {
+      // Permission not granted yet — recorder.prepare() will surface a
+      // friendly error if Record is pressed before access is allowed.
+    });
+    try {
+      const handle = await startPhraseLoop({
+        backingUrl: phrase.backing_url,
+        vocalsUrl: phrase.vocals_url,
+        loopDurationSec: phrase.duration_ms / 1000,
+        backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
+        vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
+        backingEnabled,
+        backingVolume,
+        vocalsEnabled: leadVocalEnabled,
+        onPositionMs: (ms) => {
+          currentMsRef.current = ms;
+        },
+      });
+      if (!handle) {
+        setErrorMsg('Audio not available on this device');
+        setStage('error');
+        return;
+      }
+      phraseLoopRef.current = handle;
+      setStage('playing');
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+      setStage('error');
+    }
+    // backingEnabled / backingVolume / leadVocalEnabled captured at mount;
+    // toggle effects below propagate later changes to the live handle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phrase]);
+
+  useEffect(() => {
+    void startLoop();
     return () => {
-      referenceRef.current?.unloadAsync();
+      teardown();
       playbackRef.current?.unloadAsync();
-      recorderRef.current?.stop().catch(() => {});
-      countInRef.current?.stop();
-      stopListenTicker();
       revokeLastRecording();
     };
-  }, [revokeLastRecording, stopListenTicker]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phrase.id]);
 
-  const reset = useCallback(() => {
-    setErrorMsg(null);
-    setAnalysis(null);
-    setAnalysisPending(false);
-    setFeedback(null);
-    setFeedbackPending(false);
-    (currentMsRef.current = 0);
-    // Unload any playback sound + revoke blob URL so next session starts clean
-    playbackRef.current?.unloadAsync().catch(() => {});
-    playbackRef.current = null;
-    revokeLastRecording();
-    setStage('idle');
-  }, [revokeLastRecording]);
+  // Toggles + volume slider — apply to the live loop handle without
+  // re-scheduling. Each ramps the relevant gain in ~30ms.
+  useEffect(() => {
+    phraseLoopRef.current?.setBackingEnabled(backingEnabled);
+  }, [backingEnabled]);
+  useEffect(() => {
+    phraseLoopRef.current?.setBackingVolume(backingVolume);
+  }, [backingVolume]);
+  useEffect(() => {
+    phraseLoopRef.current?.setVocalsEnabled(leadVocalEnabled);
+  }, [leadVocalEnabled]);
 
   const stopRecording = useCallback(async () => {
+    cancelStopArmRef.current?.();
+    cancelStopArmRef.current = null;
+    stopArmRaf();
+
     const recorder = recorderRef.current;
     if (!recorder) return;
-    countInRef.current?.stop();
-    countInRef.current = null;
 
     let uri = '';
     try {
@@ -151,7 +192,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       return;
     }
     recorderRef.current = null;
-    currentMsRef.current = phrase.duration_ms;
+    setMicStream(null);
 
     if (!uri) {
       setErrorMsg('No audio captured');
@@ -160,27 +201,30 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
     lastRecordingUriRef.current = uri;
 
+    // Pause the loop so the done view is quiet — the user is reading
+    // feedback and replaying their own take, not practicing again yet.
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
+
+    // Snap currentMs to the end of the phrase so the ribbon shows the
+    // full take you just sang.
+    currentMsRef.current = phrase.duration_ms;
+
+    setStage('done');
+
     try {
-      // Upload + insert (fast, network-bound). Transition to done immediately.
       const { attemptId } = await uploadAndInsert(phrase, uri);
 
-      // Start local playback of the just-recorded take right away.
       const { sound } = await Audio.Sound.createAsync({ uri });
       playbackRef.current = sound;
       sound.playAsync().catch(() => {});
 
-      setStage('done');
-
-      // Analysis runs in the background — UI is already on done.
       setAnalysisPending(true);
       runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
         setAnalysis(a);
         setAnalysisPending(false);
         if (a) {
           setFeedbackPending(true);
-          // Pass pitch_analysis + phrase metadata inline so the edge
-          // function skips its DB-read round trip — saves ~150-500ms on
-          // the take's critical path.
           requestFeedback(attemptId, feedbackInlineFor(phrase, a))
             .then(setFeedback)
             .catch((e) => console.warn('feedback request failed:', e))
@@ -191,248 +235,95 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase]);
+  }, [phrase, stopArmRaf]);
 
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
   }, [stopRecording]);
 
-  const playReference = useCallback(async () => {
-    // Prompt for mic permission inside the user-gesture handler. The
-    // browser caches the grant per-origin, so this fires the permission
-    // prompt only on the very first take per origin; later takes find
-    // the permission already granted and skip the dialog. Critical to
-    // do this BEFORE count-in: prompting mid-countdown was causing the
-    // 4 beats to elapse without the mic ever being acquired (race
-    // between getUserMedia awaiting user click and onBackingStart).
-    // primeMicPermission stops the stream immediately so Android's
-    // VOICE_COMMUNICATION pipeline doesn't degrade reference playback.
-    primeMicPermission().catch(() => {
-      // Permission denied — recorder.prepare() will surface a friendly
-      // error during countdown. Don't block Listen on this.
-    });
+  const armRecording = useCallback(async () => {
+    const handle = phraseLoopRef.current;
+    if (!handle) return;
+    setStage('armed');
 
-    setStage('listening');
-    setListenPaused(false);
-    (currentMsRef.current = 0);
-
-    // IMPORTANT — do NOT acquire the mic here. Android flips the device into
-    // VOICE_COMMUNICATION audio mode the moment a mic stream exists, which
-    // downsamples all playback to voice-band quality (slow/out-of-tune/crackly).
-    // We defer recorder.prepare() to startCountdown so Listen-stage playback
-    // stays in music-mode. The count-in clicks give us a ~2s window to warm
-    // the mic before backing + recording actually start.
-
-    // Warm both the backing AND vocals AudioBuffer caches — by count-in
-    // time they're ready, so the count-in→backing transition has zero
-    // first-byte fetch wait. Cache keys are (song_id, phrase_id, stem)
-    // so a re-signed signed URL still hits the same decoded buffer.
-    const cacheKeyFor = (stem: 'vocals' | 'backing') =>
-      `${phrase.song_id}:${phrase.id}:${stem}`;
-    if (phrase.backing_url) {
-      prefetchBuffer(phrase.backing_url, cacheKeyFor('backing'));
-    }
-    if (phrase.vocals_url) {
-      prefetchBuffer(phrase.vocals_url, cacheKeyFor('vocals'));
-    }
-
-    const { sound } = await Audio.Sound.createAsync({
-      uri: phrase.vocals_url,
-    });
-    referenceRef.current = sound;
-
-    // Sync the playhead clock to the actual audio position via status
-    // callbacks. Earlier we used a free-running performance.now() clock
-    // that started when playAsync() resolved — but the audio backend
-    // takes a non-zero amount of time to actually start emitting (decode
-    // tail, output device latency), so the clock ran ahead of the audio
-    // and the pitch ribbon + lyric strip both led the playback by what
-    // could feel like a noticeable amount. Now we anchor to
-    // status.positionMillis on every callback (~33ms) and rAF-interpolate
-    // between callbacks for smooth cursor motion.
-    let lastStatusMs = 0;
-    let lastStatusTs = performance.now();
-    let paused = false;
-    sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
-      if (!status.isLoaded) return;
-      // Always trust the audio's reported position over the JS clock —
-      // re-anchor every time. While paused, positionMillis stays put and
-      // playback time should not advance.
-      lastStatusMs = status.positionMillis ?? 0;
-      lastStatusTs = performance.now();
-      if (status.didJustFinish) {
-        stopListenTicker();
-        startCountdown();
-      }
-    });
-    // Bump the status update interval down so the anchor refreshes more
-    // often. Default is 500ms on some platforms, which lets the rAF
-    // interpolation drift visibly between callbacks.
-    sound.setProgressUpdateIntervalAsync?.(33).catch(() => {});
-    await sound.playAsync();
-
-    listenClockRef.current = {
-      pause() {
-        paused = true;
-        if (listenRafRef.current !== null) cancelAnimationFrame(listenRafRef.current);
-        listenRafRef.current = null;
-      },
-      resume() {
-        paused = false;
-        // Status callback will re-anchor on the next tick; in the
-        // meantime extrapolate from the last reported playhead.
-        lastStatusTs = performance.now();
-        if (listenRafRef.current === null) {
-          const tick = () => {
-            const elapsed = paused ? 0 : performance.now() - lastStatusTs;
-            currentMsRef.current = lastStatusMs + elapsed;
-            listenRafRef.current = requestAnimationFrame(tick);
-          };
-          listenRafRef.current = requestAnimationFrame(tick);
-        }
-      },
-      reset() {
-        lastStatusMs = 0;
-        lastStatusTs = performance.now();
-        currentMsRef.current = 0;
-      },
-    };
-    listenClockRef.current.resume();
-  }, [phrase]);
-
-  const pauseListen = useCallback(async () => {
-    if (!referenceRef.current) return;
-    await referenceRef.current.pauseAsync().catch(() => {});
-    listenClockRef.current?.pause();
-    setListenPaused(true);
-  }, []);
-
-  const resumeListen = useCallback(async () => {
-    if (!referenceRef.current) return;
-    listenClockRef.current?.resume();
-    await referenceRef.current.playAsync().catch(() => {});
-    setListenPaused(false);
-  }, []);
-
-  const restartListen = useCallback(async () => {
-    if (!referenceRef.current) return;
-    await referenceRef.current.setPositionAsync(0).catch(() => {});
-    listenClockRef.current?.reset();
-    if (listenPaused) {
-      // user explicitly hit restart while paused — keep paused state
-      return;
-    }
-    await referenceRef.current.playAsync().catch(() => {});
-  }, [listenPaused]);
-
-  const replayTake = useCallback(async () => {
-    if (replaying) return;
-    setReplaying(true);
-    try {
-      let sound = playbackRef.current;
-      if (!sound) {
-        const uri = lastRecordingUriRef.current;
-        if (!uri) return;
-        const created = await Audio.Sound.createAsync({ uri });
-        sound = created.sound;
-        playbackRef.current = sound;
-      }
-      // replayAsync restarts from 0 even if the sound finished or is mid-play.
-      try {
-        await sound.replayAsync();
-      } catch {
-        await sound.setPositionAsync(0).catch(() => {});
-        await sound.playAsync().catch(() => {});
-      }
-    } finally {
-      setReplaying(false);
-    }
-  }, [replaying]);
-
-  const restartRecording = useCallback(async () => {
-    // Abort the in-progress take and re-enter count-in. We discard the
-    // partial recording (it'd be unaligned anyway).
-    countInRef.current?.stop();
-    countInRef.current = null;
-    try {
-      await recorderRef.current?.stop();
-    } catch {
-      // Recorder might not be in a stoppable state — ignore.
-    }
-    recorderRef.current = null;
-    setMicStream(null);
-    currentMsRef.current = 0;
-    // Re-enter the same flow that started the original take.
-    void startCountdown();
-  }, []);
-
-  const startCountdown = useCallback(async () => {
-    setStage('countdown');
-    (currentMsRef.current = 0);
-    setCountdown(0);
-
-    // Acquire the mic NOW (during the 4-beat count-in window). This is
-    // the earliest point we can activate the mic without degrading the
-    // reference vocal's playback quality. Permission was already
-    // requested in playReference() so this should resolve in
-    // ~50-200ms (no prompt, just hardware open). We track the
-    // promise so onBackingStart can await it before reporting the
-    // stream to the WaveformCanvas — fire-and-forget meant the
-    // waveform sometimes saw `null` because prepare hadn't finished.
     if (!recorderRef.current) {
       recorderRef.current = createRecorder();
     }
     const recorder = recorderRef.current;
+    // Open the mic in parallel with waiting for the next loop boundary.
+    // On Android this may briefly degrade backing audio quality (the OS
+    // flips into VOICE_COMMUNICATION mode); on iOS / macOS no effect.
     const preparePromise = recorder.prepare().catch((e) => {
       console.warn('recorder prepare failed:', e);
     });
 
-    const bpm = phrase.tempo_bpm ?? 120;
-    const backingUrl = phrase.backing_url;
-
-    try {
-      countInRef.current = await startCountInAndBacking({
-        bpm,
-        beats: 4,
-        backingUrl,
-        backingVolume,
-        backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
-        vocalsUrl: phrase.vocals_url,
-        vocalsEnabled: leadVocalEnabled,
-        vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
-        onBeat: (n) => setCountdown(n),
-        onBackingStart: async () => {
-          setStage('recording');
-          // Wait for prepare() to fully resolve before reading
-          // getStream() — otherwise WaveformCanvas receives null and
-          // never draws. Worst-case adds the prepare-tail to the take
-          // start (~50-200ms with permission cached).
-          await preparePromise;
-          recorder.start().catch((e) => {
-            console.warn('recorder start failed:', e);
-          });
-          setMicStream(recorder.getStream());
-        },
-        onPositionMs: (ms) => {
-          currentMsRef.current = ms;
-        },
-        onBackingEnd: () => {
-          setTimeout(() => stopRecordingRef.current(), 0);
-        },
+    cancelArmRef.current = handle.onNextLoopStart(async () => {
+      cancelArmRef.current = null;
+      stopArmRaf();
+      await preparePromise;
+      setStage('recording');
+      recorder.start().catch((e) => {
+        console.warn('recorder start failed:', e);
       });
-    } catch (e: unknown) {
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-      setStage('error');
+      setMicStream(recorder.getStream());
+      // Auto-stop at the end of this loop — one full take.
+      cancelStopArmRef.current = phraseLoopRef.current?.onNextLoopStart(() => {
+        cancelStopArmRef.current = null;
+        void stopRecordingRef.current();
+      }) ?? null;
+    });
+
+    // Drive the "Starts in X.Xs" countdown.
+    const tick = () => {
+      const ms = phraseLoopRef.current?.getMsUntilNextLoop() ?? 0;
+      setArmCountdownMs(ms);
+      armRafRef.current = requestAnimationFrame(tick);
+    };
+    armRafRef.current = requestAnimationFrame(tick);
+  }, [stopArmRaf]);
+
+  const cancelArm = useCallback(() => {
+    cancelArmRef.current?.();
+    cancelArmRef.current = null;
+    stopArmRaf();
+    setArmCountdownMs(0);
+    setStage('playing');
+  }, [stopArmRaf]);
+
+  const replayTake = useCallback(async () => {
+    let sound = playbackRef.current;
+    if (!sound) {
+      const uri = lastRecordingUriRef.current;
+      if (!uri) return;
+      const created = await Audio.Sound.createAsync({ uri });
+      sound = created.sound;
+      playbackRef.current = sound;
     }
-  }, [phrase, leadVocalEnabled, backingVolume]);
+    try {
+      await sound.replayAsync();
+    } catch {
+      await sound.setPositionAsync(0).catch(() => {});
+      await sound.playAsync().catch(() => {});
+    }
+  }, []);
 
-  // When the toggle flips mid-take, ramp the existing gain instead of
-  // re-scheduling — no audible re-trigger and no buffer re-decode.
-  useEffect(() => {
-    countInRef.current?.setVocalsEnabled(leadVocalEnabled);
-  }, [leadVocalEnabled]);
+  const again = useCallback(async () => {
+    setErrorMsg(null);
+    setAnalysis(null);
+    setAnalysisPending(false);
+    setFeedback(null);
+    setFeedbackPending(false);
+    playbackRef.current?.unloadAsync().catch(() => {});
+    playbackRef.current = null;
+    revokeLastRecording();
+    currentMsRef.current = 0;
+    setStage('loading');
+    await startLoop();
+  }, [revokeLastRecording, startLoop]);
 
-  const showRibbon = stage !== 'idle' && stage !== 'error';
+  const loopRunning =
+    stage === 'playing' || stage === 'armed' || stage === 'recording';
+  const showRibbon = loopRunning || stage === 'done';
 
   return (
     <Chrome>
@@ -464,7 +355,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             notes={phrase.notes}
             currentMsRef={currentMsRef}
             durationMs={phrase.duration_ms}
-            active={stage === 'listening' || stage === 'recording'}
+            active={loopRunning}
           />
         </View>
       )}
@@ -473,10 +364,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         notes={phrase.notes}
         currentMsRef={currentMsRef}
         fallbackText={phrase.lyric_text}
-        active={stage === 'listening' || stage === 'recording'}
+        active={loopRunning}
       />
 
-      {stage !== 'error' && <StageIndicator stage={stage} countdown={countdown} />}
+      {stage !== 'error' && <StageIndicator stage={stage} />}
 
       {stage === 'recording' && (
         <View style={styles.waveformWrap}>
@@ -484,64 +375,58 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             stream={micStream}
             notes={phrase.notes}
             currentMsRef={currentMsRef}
-            active={stage === 'recording'}
+            active
           />
-          <Pressable
-            onPress={() => setLeadVocalEnabled((v) => !v)}
-            style={({ pressed }) => [
-              styles.vocalToggle,
-              leadVocalEnabled && styles.vocalToggleOn,
-              pressed && styles.vocalTogglePressed,
-            ]}
-            hitSlop={6}
-          >
-            <Text
-              style={[
-                styles.vocalToggleLabel,
-                leadVocalEnabled && styles.vocalToggleLabelOn,
-              ]}
-            >
-              {leadVocalEnabled ? '🎤 Lead vocal: ON' : '🎤 Lead vocal: off'}
-            </Text>
-          </Pressable>
         </View>
       )}
 
       <View style={styles.stage}>
-        {stage === 'idle' && (
-          <>
-            <RetroButton label="Listen" icon="play" onPress={playReference} size="lg" />
-            <Text style={styles.hint}>🎧 headphones recommended</Text>
+        {stage === 'loading' && (
+          <Text style={styles.savedLabel}>LOADING…</Text>
+        )}
+        {(stage === 'playing' || stage === 'armed' || stage === 'recording') && (
+          <View style={styles.liveControls}>
+            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
+            {stage === 'playing' && (
+              <RetroButton
+                label="● Record"
+                onPress={armRecording}
+                variant="danger"
+                size="lg"
+              />
+            )}
+            {stage === 'armed' && (
+              <View style={styles.armRow}>
+                <Text style={styles.armLabel}>
+                  STARTS IN {(armCountdownMs / 1000).toFixed(1)}s
+                </Text>
+                <RetroButton label="Cancel" onPress={cancelArm} size="md" />
+              </View>
+            )}
+            {stage === 'recording' && (
+              <RetroButton
+                label="■ Stop"
+                onPress={stopRecording}
+                variant="danger"
+                size="lg"
+              />
+            )}
+            <View style={styles.toggleRow}>
+              <ToggleChip
+                label="Backing"
+                enabled={backingEnabled}
+                onToggle={() => setBackingEnabled((v) => !v)}
+              />
+              <ToggleChip
+                label="Lead vocal"
+                enabled={leadVocalEnabled}
+                onToggle={() => setLeadVocalEnabled((v) => !v)}
+              />
+            </View>
             <BackingVolumeControl
               value={backingVolume}
               onChange={setBackingVolume}
             />
-          </>
-        )}
-        {stage === 'listening' && (
-          <View style={styles.controlRow}>
-            <RetroButton
-              label={listenPaused ? 'Resume' : 'Pause'}
-              icon={listenPaused ? 'play' : null}
-              onPress={listenPaused ? resumeListen : pauseListen}
-              size="md"
-            />
-            <RetroButton label="Restart" onPress={restartListen} size="md" />
-          </View>
-        )}
-        {stage === 'countdown' && (
-          <View style={styles.countdownRow}>
-            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
-            <Text style={styles.countdown}>{countdown || ' '}</Text>
-          </View>
-        )}
-        {stage === 'recording' && (
-          <View style={styles.recordingControls}>
-            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
-            <View style={styles.controlRow}>
-              <RetroButton label="Restart" onPress={restartRecording} size="md" />
-              <RetroButton label="Stop" onPress={stopRecording} variant="danger" size="md" />
-            </View>
           </View>
         )}
         {stage === 'done' && (
@@ -550,14 +435,14 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             analysisPending={analysisPending}
             feedback={feedback}
             feedbackPending={feedbackPending}
-            onAgain={reset}
+            onAgain={again}
             onReplay={replayTake}
           />
         )}
         {stage === 'error' && (
           <View style={styles.doneWrap}>
             <Text style={styles.errorLabel}>{errorMsg}</Text>
-            <RetroButton label="Try again" onPress={reset} />
+            <RetroButton label="Try again" onPress={again} />
           </View>
         )}
       </View>
@@ -565,17 +450,11 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   );
 }
 
-function StageIndicator({
-  stage,
-  countdown,
-}: {
-  stage: Stage;
-  countdown: number;
-}) {
+function StageIndicator({ stage }: { stage: Stage }) {
   const order: Array<Exclude<Stage, 'error'>> = [
-    'idle',
-    'listening',
-    'countdown',
+    'loading',
+    'playing',
+    'armed',
     'recording',
     'done',
   ];
@@ -583,10 +462,6 @@ function StageIndicator({
     <View style={styles.stageRow}>
       {order.map((s) => {
         const isActive = stage === s;
-        const label =
-          s === 'countdown' && stage === 'countdown' && countdown > 0
-            ? `${countdown}`
-            : STAGE_LABELS[s];
         return (
           <View
             key={s}
@@ -594,12 +469,44 @@ function StageIndicator({
           >
             {isActive && <View style={styles.pulse} />}
             <Text style={[styles.stagePillLabel, isActive && styles.stagePillLabelActive]}>
-              {label.toUpperCase()}
+              {STAGE_LABELS[s].toUpperCase()}
             </Text>
           </View>
         );
       })}
     </View>
+  );
+}
+
+function ToggleChip({
+  label,
+  enabled,
+  onToggle,
+}: {
+  label: string;
+  enabled: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <Pressable
+      onPress={onToggle}
+      style={({ pressed }) => [
+        styles.toggleChip,
+        enabled && styles.toggleChipOn,
+        pressed && styles.toggleChipPressed,
+      ]}
+      hitSlop={6}
+    >
+      <Text
+        style={[
+          styles.toggleChipLabel,
+          enabled && styles.toggleChipLabelOn,
+        ]}
+      >
+        {enabled ? '◉ ' : '○ '}
+        {label}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -745,46 +652,6 @@ const styles = StyleSheet.create({
     paddingTop: 4,
     paddingBottom: 8,
   },
-  vocalToggle: {
-    alignSelf: 'flex-end',
-    marginTop: 8,
-    marginRight: 0,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    ...BORDER_1BIT,
-    backgroundColor: COLORS.white,
-  },
-  vocalToggleOn: {
-    backgroundColor: COLORS.black,
-  },
-  vocalTogglePressed: {
-    transform: [{ translateX: 1 }, { translateY: 1 }],
-  },
-  vocalToggleLabel: {
-    fontFamily: FONTS.chicago,
-    fontWeight: '700',
-    fontSize: 11,
-    letterSpacing: -0.2,
-    color: COLORS.black,
-  },
-  vocalToggleLabelOn: {
-    color: COLORS.white,
-  },
-  lyricStrip: {
-    paddingHorizontal: 16,
-    paddingVertical: 4,
-    alignItems: 'flex-start',
-  },
-  lyricText: {
-    fontFamily: FONTS.monaco,
-    fontSize: 13,
-    fontWeight: '700',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    ...BORDER_1BIT,
-    ...SHADOW_1BIT,
-    backgroundColor: COLORS.white,
-  },
   stageRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -830,77 +697,49 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     gap: 10,
   },
-  stageLabel: {
+  liveControls: {
+    alignItems: 'center',
+    gap: 10,
+  },
+  armRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  armLabel: {
     fontFamily: FONTS.chicago,
     fontWeight: '700',
     fontSize: 14,
     letterSpacing: 1,
-  },
-  countdown: {
-    fontFamily: FONTS.pixel,
-    fontSize: 96,
-    lineHeight: 96,
     color: COLORS.black,
   },
-  countdownRow: {
+  toggleRow: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
-    gap: 18,
-  },
-  recordingControls: {
-    alignItems: 'center',
     gap: 8,
   },
-  hint: { fontFamily: FONTS.monaco, fontSize: 12 },
-  controlRow: { flexDirection: 'row', gap: 12, alignItems: 'center' },
-  volumeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginTop: 4,
-  },
-  volumeLabel: {
-    fontFamily: FONTS.chicago,
-    fontWeight: '700',
-    fontSize: 10,
-    letterSpacing: 1,
-    color: COLORS.black,
-  },
-  volumeBtn: {
-    width: 22,
-    height: 22,
-    alignItems: 'center',
-    justifyContent: 'center',
+  toggleChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
     ...BORDER_1BIT,
     backgroundColor: COLORS.white,
   },
-  volumeBtnPressed: {
-    transform: [{ translateX: 1 }, { translateY: 1 }],
-  },
-  volumeBtnLabel: {
-    fontFamily: FONTS.chicago,
-    fontWeight: '700',
-    fontSize: 14,
-    color: COLORS.black,
-    lineHeight: 14,
-  },
-  volumeBar: {
-    width: 80,
-    height: 8,
-    ...BORDER_1BIT,
-    backgroundColor: COLORS.white,
-    overflow: 'hidden',
-  },
-  volumeFill: {
-    height: '100%',
+  toggleChipOn: {
     backgroundColor: COLORS.black,
   },
-  volumePct: {
-    fontFamily: FONTS.monaco,
-    fontSize: 10,
-    width: 32,
+  toggleChipPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  toggleChipLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 11,
+    letterSpacing: -0.2,
     color: COLORS.black,
   },
+  toggleChipLabelOn: {
+    color: COLORS.white,
+  },
+  controlRow: { flexDirection: 'row', gap: 12, alignItems: 'center' },
   doneWrap: { alignItems: 'center', gap: 10, maxWidth: 420, width: '100%' },
   savedLabel: {
     fontFamily: FONTS.chicago,
@@ -963,5 +802,53 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     color: '#c00',
     maxWidth: 280,
+  },
+  volumeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 4,
+  },
+  volumeLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 10,
+    letterSpacing: 1,
+    color: COLORS.black,
+  },
+  volumeBtn: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  volumeBtnPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  volumeBtnLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 14,
+    color: COLORS.black,
+    lineHeight: 14,
+  },
+  volumeBar: {
+    width: 80,
+    height: 8,
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+  },
+  volumeFill: {
+    height: '100%',
+    backgroundColor: COLORS.black,
+  },
+  volumePct: {
+    fontFamily: FONTS.monaco,
+    fontSize: 10,
+    width: 32,
+    color: COLORS.black,
   },
 });
