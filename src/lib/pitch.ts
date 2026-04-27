@@ -227,6 +227,18 @@ export async function extractPitchCurve(audioUri: string): Promise<PitchSample[]
   return runYinOnMainThread(channel, sampleRate, hopSamples);
 }
 
+/** Fold a midi-difference into the same octave: returns the signed
+ *  delta in semitones with magnitude <= 6. Lets us count someone
+ *  singing the same note an octave up (or two octaves down) as on
+ *  pitch — the WaveformCanvas already does this for its stroke colour;
+ *  this brings the recorded-take analysis in line. */
+function octaveFoldedSemitones(actual: number, expected: number): number {
+  let d = actual - expected;
+  while (d > 6) d -= 12;
+  while (d < -6) d += 12;
+  return d;
+}
+
 export function compareToReference(
   curve: PitchSample[],
   notes: MidiNote[],
@@ -248,9 +260,12 @@ export function compareToReference(
       };
     }
     const actualMidi = median(inWindow.map((s) => s.midi));
-    const centsOff = (actualMidi - note.pitch_midi) * 100;
+    const centsOff =
+      octaveFoldedSemitones(actualMidi, note.pitch_midi) * 100;
     const onPitchCount = inWindow.filter(
-      (s) => Math.abs((s.midi - note.pitch_midi) * 100) < HIT_TOLERANCE_CENTS,
+      (s) =>
+        Math.abs(octaveFoldedSemitones(s.midi, note.pitch_midi) * 100) <
+        HIT_TOLERANCE_CENTS,
     ).length;
     return {
       idx,

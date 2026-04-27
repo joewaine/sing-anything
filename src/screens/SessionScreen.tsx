@@ -186,6 +186,42 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     phraseLoopRef.current?.setVocalsEnabled(leadVocalEnabled);
   }, [leadVocalEnabled]);
 
+  // Start (or restart) playback of the just-recorded take alongside a
+  // looping phrase backing track. Both anchor to ctx.currentTime so they
+  // stay roughly aligned for the duration of the take. Backing + lead
+  // vocal can be toggled in real time via the chips below — useful for
+  // listening to your voice against just the backing, or comparing
+  // your phrasing against the reference vocal.
+  const startDonePlayback = useCallback(async () => {
+    playbackRef.current?.unloadAsync().catch(() => {});
+    playbackRef.current = null;
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
+
+    const uri = lastRecordingUriRef.current;
+    if (!uri) return;
+
+    const s = settingsRef.current;
+    const handle = await startPhraseLoop({
+      backingUrl: phrase.backing_url,
+      vocalsUrl: phrase.vocals_url,
+      loopDurationSec: phrase.duration_ms / 1000,
+      backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
+      vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
+      backingEnabled: s.backingEnabled,
+      backingVolume: s.backingVolume,
+      vocalsEnabled: s.leadVocalEnabled,
+      onPositionMs: (ms) => {
+        currentMsRef.current = ms;
+      },
+    });
+    if (handle) phraseLoopRef.current = handle;
+
+    const { sound } = await Audio.Sound.createAsync({ uri });
+    playbackRef.current = sound;
+    sound.playAsync().catch(() => {});
+  }, [phrase]);
+
   const stopRecording = useCallback(async () => {
     const recorder = recorderRef.current;
     if (!recorder) return;
@@ -208,20 +244,15 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
     lastRecordingUriRef.current = uri;
 
-    // Pause the loop so the done view is quiet — the user is reading
-    // feedback and replaying their own take, not practicing again yet.
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
     currentMsRef.current = phrase.duration_ms;
 
     setStage('done');
+    void startDonePlayback();
 
     try {
       const { attemptId } = await uploadAndInsert(phrase, uri);
-
-      const { sound } = await Audio.Sound.createAsync({ uri });
-      playbackRef.current = sound;
-      sound.playAsync().catch(() => {});
 
       setAnalysisPending(true);
       runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
@@ -239,7 +270,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase]);
+  }, [phrase, startDonePlayback]);
 
   const startRecording = useCallback(async () => {
     if (!recorderRef.current) {
@@ -299,22 +330,11 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     })();
   }, [startLoopFromZero]);
 
+  // Replay tears down the existing playback + backing loop and starts
+  // fresh, so backing + mic always start aligned at t=0 of the take.
   const replayTake = useCallback(async () => {
-    let sound = playbackRef.current;
-    if (!sound) {
-      const uri = lastRecordingUriRef.current;
-      if (!uri) return;
-      const created = await Audio.Sound.createAsync({ uri });
-      sound = created.sound;
-      playbackRef.current = sound;
-    }
-    try {
-      await sound.replayAsync();
-    } catch {
-      await sound.setPositionAsync(0).catch(() => {});
-      await sound.playAsync().catch(() => {});
-    }
-  }, []);
+    await startDonePlayback();
+  }, [startDonePlayback]);
 
   const again = useCallback(async () => {
     setErrorMsg(null);
@@ -443,6 +463,12 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             feedbackPending={feedbackPending}
             onAgain={again}
             onReplay={replayTake}
+            backingEnabled={backingEnabled}
+            onToggleBacking={() => setBackingEnabled((v) => !v)}
+            leadVocalEnabled={leadVocalEnabled}
+            onToggleLeadVocal={() => setLeadVocalEnabled((v) => !v)}
+            backingVolume={backingVolume}
+            onChangeBackingVolume={setBackingVolume}
           />
         )}
         {stage === 'error' && (
@@ -523,6 +549,12 @@ function DoneView({
   feedbackPending,
   onAgain,
   onReplay,
+  backingEnabled,
+  onToggleBacking,
+  leadVocalEnabled,
+  onToggleLeadVocal,
+  backingVolume,
+  onChangeBackingVolume,
 }: {
   analysis: PitchAnalysis | null;
   analysisPending: boolean;
@@ -530,6 +562,12 @@ function DoneView({
   feedbackPending: boolean;
   onAgain: () => void;
   onReplay: () => void;
+  backingEnabled: boolean;
+  onToggleBacking: () => void;
+  leadVocalEnabled: boolean;
+  onToggleLeadVocal: () => void;
+  backingVolume: number;
+  onChangeBackingVolume: (v: number) => void;
 }) {
   const pct = analysis ? Math.round(analysis.hit_rate * 100) : null;
   const cents = analysis ? Math.round(analysis.avg_abs_cents_off) : null;
@@ -570,6 +608,22 @@ function DoneView({
       ) : feedbackPending ? (
         <Text style={styles.feedbackPending}>COACH IS LISTENING…</Text>
       ) : null}
+      <View style={styles.toggleRow}>
+        <ToggleChip
+          label="Backing"
+          enabled={backingEnabled}
+          onToggle={onToggleBacking}
+        />
+        <ToggleChip
+          label="Lead vocal"
+          enabled={leadVocalEnabled}
+          onToggle={onToggleLeadVocal}
+        />
+      </View>
+      <BackingVolumeControl
+        value={backingVolume}
+        onChange={onChangeBackingVolume}
+      />
       <View style={styles.controlRow}>
         <RetroButton label="Replay" icon="play" onPress={onReplay} size="md" />
         <RetroButton label="Again" onPress={onAgain} size="md" />
