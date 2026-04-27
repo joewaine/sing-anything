@@ -9,6 +9,41 @@ export interface Recorder {
   getStream(): MediaStream | null;
 }
 
+/**
+ * Trigger the browser's mic-permission prompt without keeping the stream
+ * open. Used during a clear user gesture (Listen button click) so the
+ * grant is cached BEFORE count-in starts; subsequent recorder.prepare()
+ * calls reuse the cached permission and don't show a prompt mid-take.
+ *
+ * On Android, holding a mic stream open even briefly flips the audio
+ * pipeline into VOICE_COMMUNICATION mode (downsamples playback to
+ * 16kHz). We stop the tracks immediately to release that lock.
+ *
+ * Returns true if permission was granted, false otherwise. Native
+ * platforms request via expo-av's permission API.
+ */
+export async function primeMicPermission(): Promise<boolean> {
+  if (Platform.OS !== 'web') {
+    try {
+      const perm = await Audio.requestPermissionsAsync();
+      return !!perm.granted;
+    } catch {
+      return false;
+    }
+  }
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+    return false;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Release immediately — we just wanted the permission grant.
+    stream.getTracks().forEach((t) => t.stop());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // MIME types in priority order. Chromium + Firefox take the first; iOS Safari
 // only speaks mp4 (AAC), so we probe down the list with isTypeSupported.
 const MIME_CANDIDATES = [

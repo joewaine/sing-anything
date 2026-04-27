@@ -9,7 +9,7 @@ import RetroButton from '../components/RetroButton';
 import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
 import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/feedback';
-import { createRecorder, type Recorder } from '../lib/recorder';
+import { createRecorder, primeMicPermission, type Recorder } from '../lib/recorder';
 import { startCountInAndBacking, type CountInHandleWithVocals } from '../lib/countIn';
 import { prefetchBuffer } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
@@ -195,6 +195,20 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, [stopRecording]);
 
   const playReference = useCallback(async () => {
+    // Prompt for mic permission inside the user-gesture handler. The
+    // browser caches the grant per-origin, so this fires the permission
+    // prompt only on the very first take per origin; later takes find
+    // the permission already granted and skip the dialog. Critical to
+    // do this BEFORE count-in: prompting mid-countdown was causing the
+    // 4 beats to elapse without the mic ever being acquired (race
+    // between getUserMedia awaiting user click and onBackingStart).
+    // primeMicPermission stops the stream immediately so Android's
+    // VOICE_COMMUNICATION pipeline doesn't degrade reference playback.
+    primeMicPermission().catch(() => {
+      // Permission denied — recorder.prepare() will surface a friendly
+      // error during countdown. Don't block Listen on this.
+    });
+
     setStage('listening');
     setListenPaused(false);
     (currentMsRef.current = 0);
@@ -310,14 +324,19 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     (currentMsRef.current = 0);
     setCountdown(0);
 
-    // Acquire the mic NOW (during the 4-beat count-in window). This is the
-    // earliest point we can activate the mic without degrading the reference
-    // vocal's playback quality. Fire-and-forget — the ~200-500ms cold start
-    // fits inside the count-in.
+    // Acquire the mic NOW (during the 4-beat count-in window). This is
+    // the earliest point we can activate the mic without degrading the
+    // reference vocal's playback quality. Permission was already
+    // requested in playReference() so this should resolve in
+    // ~50-200ms (no prompt, just hardware open). We track the
+    // promise so onBackingStart can await it before reporting the
+    // stream to the WaveformCanvas — fire-and-forget meant the
+    // waveform sometimes saw `null` because prepare hadn't finished.
     if (!recorderRef.current) {
       recorderRef.current = createRecorder();
     }
-    recorderRef.current.prepare().catch((e) => {
+    const recorder = recorderRef.current;
+    const preparePromise = recorder.prepare().catch((e) => {
       console.warn('recorder prepare failed:', e);
     });
 
@@ -335,12 +354,17 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         vocalsEnabled: leadVocalEnabled,
         vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
         onBeat: (n) => setCountdown(n),
-        onBackingStart: () => {
+        onBackingStart: async () => {
           setStage('recording');
-          recorderRef.current?.start().catch((e) => {
+          // Wait for prepare() to fully resolve before reading
+          // getStream() — otherwise WaveformCanvas receives null and
+          // never draws. Worst-case adds the prepare-tail to the take
+          // start (~50-200ms with permission cached).
+          await preparePromise;
+          recorder.start().catch((e) => {
             console.warn('recorder start failed:', e);
           });
-          setMicStream(recorderRef.current?.getStream() ?? null);
+          setMicStream(recorder.getStream());
         },
         onPositionMs: (ms) => {
           currentMsRef.current = ms;
