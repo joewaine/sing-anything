@@ -294,7 +294,7 @@ function SongRow({
             {song.name}
           </Text>
         </Pressable>
-        {song.artist && <Text style={styles.rowArtist} numberOfLines={1}>{song.artist}</Text>}
+        {/* Artist subtitle intentionally hidden in the library list — title alone is the read-target. */}
         <Text style={[styles.rowStatus, isError && styles.rowStatusError]}>
           {STATUS_LABEL[song.status] ?? song.status}
           {isError && song.error ? ` — ${song.error}` : ''}
