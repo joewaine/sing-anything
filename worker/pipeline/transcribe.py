@@ -33,11 +33,19 @@ def _get_aligner(language: str, device: str):
     return _align_cache[key]
 
 
-def transcribe_words(vocals_path: Path, model_name: str = "large-v3") -> tuple[str, list[dict]]:
+def transcribe_words(
+    vocals_path: Path,
+    model_name: str = "large-v3",
+    audio: Any | None = None,
+) -> tuple[str, list[dict]]:
     """Run Whisper + wav2vec2 forced alignment.
 
     Returns (detected_language, words). Each word:
         {"start": float seconds, "end": float seconds, "word": str, "score": float}
+
+    Optional `audio`: pre-loaded float32 mono numpy array at 16 kHz (whisperx's
+    expected shape). Pass it when the orchestrator has already decoded the
+    file so we don't pay decode twice. If absent, fall back to disk load.
     """
     import torch
     import whisperx
@@ -46,7 +54,8 @@ def transcribe_words(vocals_path: Path, model_name: str = "large-v3") -> tuple[s
     compute_type = "float16" if device == "cuda" else "int8"
 
     asr = _get_asr(model_name, device, compute_type)
-    audio = whisperx.load_audio(str(vocals_path))
+    if audio is None:
+        audio = whisperx.load_audio(str(vocals_path))
     # Force English — whisper's first-segment language detection can flip
     # to non-English on sparse vocal stems (observed `ru` on a Gerry Rafferty
     # clip), which then loads the wrong wav2vec2 aligner and produces

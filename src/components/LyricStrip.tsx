@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
+import { makeActiveNoteCursor } from '../lib/activeNoteCursor';
 import type { MidiNote } from '../types';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
@@ -55,15 +56,10 @@ export default function LyricStrip({
       return;
     }
     let rafId = 0;
+    const cursor = makeActiveNoteCursor(notes);
     const tick = () => {
       const ms = currentMsRef.current ?? 0;
-      let idx = -1;
-      for (let i = 0; i < notes.length; i++) {
-        if (ms >= notes[i].start_ms && ms < notes[i].end_ms) {
-          idx = i;
-          break;
-        }
-      }
+      const idx = cursor(ms);
       if (idx !== activeIdxRef.current) {
         activeIdxRef.current = idx;
         setActiveIdx(idx);

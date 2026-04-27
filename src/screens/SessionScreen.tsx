@@ -8,7 +8,7 @@ import WaveformCanvas from '../components/WaveformCanvas';
 import RetroButton from '../components/RetroButton';
 import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
-import { requestFeedback, type FeedbackResult } from '../lib/feedback';
+import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/feedback';
 import { createRecorder, type Recorder } from '../lib/recorder';
 import { startCountInAndBacking, type CountInHandleWithVocals } from '../lib/countIn';
 import { prefetchBuffer } from '../lib/audioService';
@@ -76,15 +76,32 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, []);
 
   const revokeLastRecording = useCallback(() => {
+    const uri = lastRecordingUriRef.current;
+    lastRecordingUriRef.current = null;
+    if (!uri) return;
     if (
-      lastRecordingUriRef.current &&
-      lastRecordingUriRef.current.startsWith('blob:') &&
+      uri.startsWith('blob:') &&
       typeof URL !== 'undefined' &&
       URL.revokeObjectURL
     ) {
-      URL.revokeObjectURL(lastRecordingUriRef.current);
+      URL.revokeObjectURL(uri);
+      return;
     }
-    lastRecordingUriRef.current = null;
+    // Native: expo-av writes recordings to a file:// path inside the
+    // app's cache. Without explicit cleanup these accumulate ~2-3MB per
+    // attempt and can balloon a long practice session into hundreds of
+    // MB. Lazy-import so the web bundle doesn't carry expo-file-system
+    // for browsers that don't need it.
+    if (uri.startsWith('file://')) {
+      void (async () => {
+        try {
+          const FS = await import('expo-file-system');
+          await FS.deleteAsync(uri, { idempotent: true });
+        } catch (e) {
+          console.warn('native attempt cleanup failed:', e);
+        }
+      })();
+    }
   }, []);
 
   useEffect(() => {
@@ -158,7 +175,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         setAnalysisPending(false);
         if (a) {
           setFeedbackPending(true);
-          requestFeedback(attemptId)
+          // Pass pitch_analysis + phrase metadata inline so the edge
+          // function skips its DB-read round trip — saves ~150-500ms on
+          // the take's critical path.
+          requestFeedback(attemptId, feedbackInlineFor(phrase, a))
             .then(setFeedback)
             .catch((e) => console.warn('feedback request failed:', e))
             .finally(() => setFeedbackPending(false));
@@ -186,9 +206,17 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     // stays in music-mode. The count-in clicks give us a ~2s window to warm
     // the mic before backing + recording actually start.
 
-    // Warm the backing AudioBuffer cache — by count-in time it's ready.
+    // Warm both the backing AND vocals AudioBuffer caches — by count-in
+    // time they're ready, so the count-in→backing transition has zero
+    // first-byte fetch wait. Cache keys are (song_id, phrase_id, stem)
+    // so a re-signed signed URL still hits the same decoded buffer.
+    const cacheKeyFor = (stem: 'vocals' | 'backing') =>
+      `${phrase.song_id}:${phrase.id}:${stem}`;
     if (phrase.backing_url) {
-      prefetchBuffer(phrase.backing_url);
+      prefetchBuffer(phrase.backing_url, cacheKeyFor('backing'));
+    }
+    if (phrase.vocals_url) {
+      prefetchBuffer(phrase.vocals_url, cacheKeyFor('vocals'));
     }
 
     const { sound } = await Audio.Sound.createAsync({
@@ -302,8 +330,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         beats: 4,
         backingUrl,
         backingVolume: BACKING_VOLUME,
+        backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
         vocalsUrl: phrase.vocals_url,
         vocalsEnabled: leadVocalEnabled,
+        vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
         onBeat: (n) => setCountdown(n),
         onBackingStart: () => {
           setStage('recording');

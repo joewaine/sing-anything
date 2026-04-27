@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import { StyleSheet, Text, View, type LayoutChangeEvent } from 'react-native';
+import { makeActiveNoteCursor } from '../lib/activeNoteCursor';
 import type { MidiNote } from '../types';
 import {
   BORDER_1BIT,
@@ -77,11 +78,10 @@ function NotesLayer({ geometry }: { geometry: NoteGeom[] }) {
   );
 }
 
-const MemoNotesLayer = (function () {
-  // eslint-disable-next-line react/display-name
-  const M = (props: { geometry: NoteGeom[] }) => NotesLayer(props);
-  return M;
-})();
+// Real React.memo (the prior version was a wrapper function with no
+// memoization — geometry is referentially stable thanks to useMemo, so
+// the actual memo skip-rerender behavior matters at 60fps).
+const MemoNotesLayer = memo(NotesLayer);
 
 export default function PitchRibbon({
   notes,
@@ -98,15 +98,20 @@ export default function PitchRibbon({
 
   const useMarquee = durationMs > MARQUEE_THRESHOLD_MS;
 
-  const minPitch = useMemo(() => {
-    if (notes.length === 0) return 60;
-    return Math.min(...notes.map((n) => n.pitch_midi));
-  }, [notes]);
-
-  const pitchRange = useMemo(() => {
-    if (notes.length === 0) return 12;
-    const pitches = notes.map((n) => n.pitch_midi);
-    return Math.max(3, Math.max(...pitches) - Math.min(...pitches) + 2);
+  // One pass over notes computes both bounds. Replaces two
+  // `Math.min/max(...notes.map(...))` invocations which spread-allocate
+  // an entire array every recompute and trip the spread arity limit on
+  // very long phrases.
+  const { minPitch, pitchRange } = useMemo(() => {
+    if (notes.length === 0) return { minPitch: 60, pitchRange: 12 };
+    let mn = notes[0].pitch_midi;
+    let mx = notes[0].pitch_midi;
+    for (let i = 1; i < notes.length; i++) {
+      const p = notes[i].pitch_midi;
+      if (p < mn) mn = p;
+      if (p > mx) mx = p;
+    }
+    return { minPitch: mn, pitchRange: Math.max(3, mx - mn + 2) };
   }, [notes]);
 
   const innerWidth = useMarquee
@@ -138,9 +143,12 @@ export default function PitchRibbon({
   // Single rAF loop drives (a) the scroller/cursor transform imperatively
   // and (b) the active-note React state. (a) runs every frame with zero
   // React work; (b) only fires when the active index actually changes.
+  // Active-note lookup uses a monotonic cursor (O(1) amortized) instead
+  // of an O(N) linear scan — critical at 60fps × 30+ notes per phrase.
   useEffect(() => {
     if (!active) return;
     let rafId = 0;
+    const cursor = makeActiveNoteCursor(notes);
     const tick = () => {
       const ms = currentMsRef.current ?? 0;
 
@@ -154,13 +162,7 @@ export default function PitchRibbon({
         if (el) el.style.transform = `translateX(${x}px)`;
       }
 
-      let idx = -1;
-      for (let i = 0; i < geometry.length; i++) {
-        if (ms >= geometry[i].startMs && ms < geometry[i].endMs) {
-          idx = i;
-          break;
-        }
-      }
+      const idx = cursor(ms);
       if (idx !== activeIdxRef.current) {
         activeIdxRef.current = idx;
         setActiveIdx(idx);
@@ -170,7 +172,7 @@ export default function PitchRibbon({
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [active, useMarquee, playheadX, durationMs, containerWidth, geometry, currentMsRef]);
+  }, [active, useMarquee, playheadX, durationMs, containerWidth, notes, currentMsRef]);
 
   const onLayout = (e: LayoutChangeEvent) => setContainerWidth(e.nativeEvent.layout.width);
 

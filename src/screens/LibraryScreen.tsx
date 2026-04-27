@@ -54,9 +54,10 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack, onSignOut 
     void refresh();
     if (!hasSupabaseConfig) return;
 
-    // Realtime subscription on this user's songs — covers insert (upload
-    // finished elsewhere), update (status transitions, rename), delete
-    // (clean up on remote deletion). Replaces an earlier 10s polling loop.
+    // Realtime subscription on this user's songs. Apply each event as an
+    // in-place delta against the current list — much cheaper than a full
+    // re-fetch round trip per event (a single processing song fires 5-15
+    // updates in 60-90s). One catch-up `refresh()` ran on subscribe.
     let unsub: (() => void) | null = null;
     (async () => {
       const supabase = requireSupabase();
@@ -67,12 +68,48 @@ export default function LibraryScreen({ onUpload, onPickSong, onBack, onSignOut 
         .on(
           'postgres_changes',
           {
-            event: '*',
+            event: 'INSERT',
             schema: 'public',
             table: 'songs',
             filter: `user_id=eq.${user.id}`,
           },
-          () => void refresh(),
+          (payload) => {
+            const row = payload.new as Song;
+            setSongs((prev) => {
+              if (!prev) return prev;
+              if (prev.some((s) => s.id === row.id)) return prev;
+              return [row, ...prev];
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'songs',
+            filter: `user_id=eq.${user.id}`,
+          },
+          (payload) => {
+            const row = payload.new as Song;
+            setSongs((prev) =>
+              prev ? prev.map((s) => (s.id === row.id ? { ...s, ...row } : s)) : prev,
+            );
+          },
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: 'DELETE',
+            schema: 'public',
+            table: 'songs',
+            filter: `user_id=eq.${user.id}`,
+          },
+          (payload) => {
+            const id = (payload.old as { id?: string }).id;
+            if (!id) return;
+            setSongs((prev) => (prev ? prev.filter((s) => s.id !== id) : prev));
+          },
         )
         .subscribe();
       unsub = () => {

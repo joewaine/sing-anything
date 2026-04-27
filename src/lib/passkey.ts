@@ -17,6 +17,7 @@
  * session in its own storage key.
  */
 
+import { clearBufferCache } from './audioService';
 import { hasSupabaseConfig, requireSupabase } from './supabase';
 
 // Demo account: this email signs into a real email-auth Supabase user that
@@ -84,6 +85,11 @@ export async function requestMagicLink(email: string): Promise<RequestResult> {
 }
 
 export async function signOut(): Promise<void> {
+  // Drop decoded buffers so a different user logging in next doesn't
+  // reuse the previous user's audio (the cache is keyed by URL or
+  // `(songId, phraseId, stem)` — neither is privacy-preserving across
+  // sessions). Cheap to redecode if the same user comes back.
+  clearBufferCache();
   if (!hasSupabaseConfig) return;
   const supabase = requireSupabase();
   await supabase.auth.signOut();

@@ -60,27 +60,114 @@ function median(xs: number[]): number {
 
 const yieldToEventLoop = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/**
- * Decode an audio blob URL and run a monophonic pitch tracker across it.
- * Yields to the event loop periodically so the UI stays responsive while the
- * YIN loop runs. Reuses the shared AudioContext so we don't hit Safari's
- * per-page context cap on repeated attempts.
- */
-export async function extractPitchCurve(audioUri: string): Promise<PitchSample[]> {
-  const ctx = getAudioContext();
-  if (!ctx) return [];
+// ─── Web Worker–based YIN ────────────────────────────────────────────────
+//
+// Web Workers have no AudioContext, so audio decoding has to happen on the
+// main thread. The decoding itself is fast (~50-200ms) and yields to paint;
+// the slow part is the YIN loop (2-5s for a 7s phrase) — which DOES need to
+// be off-main. We main-thread-decode, then transfer the Float32Array PCM
+// to a one-shot blob worker that returns the pitch curve.
+//
+// Inline blob-worker source (string template) lets this work across every
+// bundler combo (Metro, Webpack, Vite) without needing a separate
+// .worker.ts file or import.meta.url tricks.
 
-  const res = await fetch(audioUri);
-  const arrayBuffer = await res.arrayBuffer();
-  // decodeAudioData will consume (detach) the buffer — pass it directly instead
-  // of allocating a second copy.
-  const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+const WORKER_SOURCE = `
+self.onmessage = async (e) => {
+  const { samplesBuffer, sampleRate, windowSize, hopSamples,
+          clarityThreshold, hopsBeforeYield } = e.data;
+  const samples = new Float32Array(samplesBuffer);
 
-  const sampleRate = audioBuffer.sampleRate;
-  const samples = audioBuffer.getChannelData(0);
-  const hopSamples = Math.max(1, Math.floor((HOP_MS / 1000) * sampleRate));
+  // Inline pitchy ESM via dynamic import. Pitchy is small + ESM-native.
+  const { PitchDetector } = await import('https://esm.sh/pitchy@4.1.0?bundle');
+
+  const detector = PitchDetector.forFloat32Array(windowSize);
+  const out = [];
+  let sinceYield = 0;
+  for (let i = 0; i + windowSize < samples.length; i += hopSamples) {
+    const window = samples.subarray(i, i + windowSize);
+    const [freq, clarity] = detector.findPitch(window, sampleRate);
+    if (++sinceYield >= hopsBeforeYield) {
+      sinceYield = 0;
+      // Yield to the worker's own event loop so postMessage from main can
+      // still reach us if the user navigates away.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    if (freq <= 0 || clarity < clarityThreshold) continue;
+    const midi = 69 + 12 * Math.log2(freq / 440);
+    if (midi < 40 || midi > 90) continue;
+    out.push({
+      time_ms: Math.round((i / sampleRate) * 1000),
+      freq_hz: freq,
+      midi,
+      clarity,
+    });
+  }
+  self.postMessage({ ok: true, samples: out });
+};
+`;
+
+let _workerUrl: string | null = null;
+
+function workerSupported(): boolean {
+  return (
+    typeof Worker !== 'undefined' &&
+    typeof Blob !== 'undefined' &&
+    typeof URL !== 'undefined' &&
+    typeof URL.createObjectURL === 'function'
+  );
+}
+
+function getWorkerUrl(): string {
+  if (_workerUrl) return _workerUrl;
+  const blob = new Blob([WORKER_SOURCE], { type: 'application/javascript' });
+  _workerUrl = URL.createObjectURL(blob);
+  return _workerUrl;
+}
+
+async function runYinInWorker(
+  pcm: Float32Array,
+  sampleRate: number,
+  hopSamples: number,
+): Promise<PitchSample[]> {
+  return new Promise<PitchSample[]>((resolve, reject) => {
+    const worker = new Worker(getWorkerUrl());
+    const timeout = setTimeout(() => {
+      worker.terminate();
+      reject(new Error('pitch-worker timed out'));
+    }, 60_000);
+    worker.onmessage = (e) => {
+      clearTimeout(timeout);
+      worker.terminate();
+      if (e.data?.ok) resolve(e.data.samples as PitchSample[]);
+      else reject(new Error(e.data?.error || 'pitch-worker failed'));
+    };
+    worker.onerror = (e) => {
+      clearTimeout(timeout);
+      worker.terminate();
+      reject(new Error(e.message || 'pitch-worker crashed'));
+    };
+    // Transfer the PCM buffer ownership rather than copying.
+    worker.postMessage(
+      {
+        samplesBuffer: pcm.buffer,
+        sampleRate,
+        windowSize: WINDOW_SIZE,
+        hopSamples,
+        clarityThreshold: CLARITY_THRESHOLD,
+        hopsBeforeYield: HOPS_BEFORE_YIELD,
+      },
+      [pcm.buffer],
+    );
+  });
+}
+
+async function runYinOnMainThread(
+  samples: Float32Array,
+  sampleRate: number,
+  hopSamples: number,
+): Promise<PitchSample[]> {
   const detector = PitchDetector.forFloat32Array(WINDOW_SIZE);
-
   const out: PitchSample[] = [];
   let sinceYield = 0;
   for (let i = 0; i + WINDOW_SIZE < samples.length; i += hopSamples) {
@@ -102,6 +189,42 @@ export async function extractPitchCurve(audioUri: string): Promise<PitchSample[]
     });
   }
   return out;
+}
+
+/**
+ * Decode an audio blob URL and run a monophonic pitch tracker across it.
+ * decodeAudioData runs on the main thread (fast, paint-friendly); the YIN
+ * loop runs in a one-shot blob worker so the 2-5s of analysis doesn't
+ * freeze the post-record UI. Falls back to main-thread YIN with periodic
+ * yields when Web Workers aren't available (older Safari, native RN).
+ */
+export async function extractPitchCurve(audioUri: string): Promise<PitchSample[]> {
+  const ctx = getAudioContext();
+  if (!ctx) return [];
+
+  const res = await fetch(audioUri);
+  const arrayBuffer = await res.arrayBuffer();
+  // decodeAudioData will consume (detach) the buffer — pass it directly
+  // instead of allocating a second copy.
+  const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+  const sampleRate = audioBuffer.sampleRate;
+  const channel = audioBuffer.getChannelData(0);
+  const hopSamples = Math.max(1, Math.floor((HOP_MS / 1000) * sampleRate));
+
+  if (workerSupported()) {
+    try {
+      // Copy into a fresh transferable buffer (channel is owned by
+      // AudioBuffer; transferring its underlying ArrayBuffer would
+      // detach the audio data).
+      const pcm = new Float32Array(channel.length);
+      pcm.set(channel);
+      return await runYinInWorker(pcm, sampleRate, hopSamples);
+    } catch (e) {
+      console.warn('pitch worker failed, falling back to main thread:', e);
+    }
+  }
+  return runYinOnMainThread(channel, sampleRate, hopSamples);
 }
 
 export function compareToReference(

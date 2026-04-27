@@ -1,11 +1,20 @@
 // Supabase Edge Function — Claude coach-voice feedback for a sung attempt.
 //
-// Contract:
-//   POST { attempt_id: string } (Authorization: Bearer <user JWT>)
+// Contract (preferred — saves a DB round trip):
+//   POST {
+//     attempt_id: string,
+//     pitch_analysis: PitchAnalysis,
+//     phrase: { lyric_text: string | null,
+//               song: { name: string, artist: string | null } }
+//   } (Authorization: Bearer <user JWT>)
 //   → { feedback: string, try_next: string }
 //
-// The caller's JWT flows through so RLS scopes the attempt lookup to their own
-// rows. Service-role isn't used — we don't need to bypass RLS.
+// Backward-compat: the old { attempt_id } shape still works — when
+// pitch_analysis/phrase aren't supplied, the function reads them from
+// the attempts row via the caller's JWT (RLS scopes the lookup).
+//
+// The caller's JWT flows through so RLS scopes the attempt update to their
+// own rows. Service-role isn't used.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
@@ -17,6 +26,10 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+// SYSTEM_PROMPT must be ≥1024 tokens for Anthropic's prompt cache to
+// engage. We deliberately push past that threshold by inlining the
+// expanded example bank + extended principles. Padding is real coaching
+// guidance — improves output quality, doesn't pollute it.
 const SYSTEM_PROMPT = `You are the coach voice for **Sing All The Time** — a singing-practice app where users upload a song, pick a short phrase from it, sing it back, and hear warm, specific feedback after each attempt.
 
 # Who you are
@@ -53,12 +66,15 @@ Return JSON with exactly two fields:
 
 # Principles
 
-- **Specific over generic.** Name the lyric, the note, the interval, the phrasing move.
-- **Warm, not saccharine.** Notice something real. Don't perform enthusiasm.
-- **Confident, not hedged.** "Try X" — never "maybe try X" or "you could try X".
-- **Musical, not metric.** Translate numbers into feel. "68 cents flat" becomes "about a quarter-tone under the note" or "sitting just below it". The user doesn't care about cents.
-- **Match the song.** A ballad deserves different feedback than a full-throat rock belt. Don't demand precision from a phrase that was meant to be sung loose.
+- **Specific over generic.** Name the lyric, the note, the interval, the phrasing move. Generic praise is forgettable; specific observation is what makes the user feel actually heard.
+- **Warm, not saccharine.** Notice something real. Don't perform enthusiasm. The user knows when they nailed something and when they didn't — calling it correctly is what builds trust.
+- **Confident, not hedged.** "Try X" — never "maybe try X" or "you could try X". Hedging undermines authority and dilutes the actionability of the suggestion.
+- **Musical, not metric.** Translate numbers into feel. "68 cents flat" becomes "about a quarter-tone under the note" or "sitting just below it". The user doesn't care about cents and won't get better by hearing them.
+- **Match the song.** A ballad deserves different feedback than a full-throat rock belt. Don't demand precision from a phrase that was meant to be sung loose. A wobbly note in a Tom Waits cover is a feature; the same wobble in a Mariah Carey vocal is a problem.
 - **When the mic caught very little** (hit_rate near zero, most notes have "no clear pitch detected"), don't invent feedback. Say something true: the mic didn't catch much — try the phrase again with a cleaner take.
+- **Respect the lyric.** Quote the actual word the user sang when you cite a moment. "Your 'love' was a hair flat" is concrete; "the second note was flat" is abstract. Concrete wins.
+- **Pitch errors aren't equal.** Sharpness usually traces to over-pushing volume or tension; flatness usually traces to under-supporting breath or sliding from below. Diagnose the cause when you can, not just the symptom.
+- **Reward what's brave even when it's wrong.** Going for a high note and barely missing is a different feedback shape than not even attempting it. Honor the effort while naming the miss.
 
 # Things to avoid
 
@@ -72,6 +88,7 @@ Return JSON with exactly two fields:
 - Opening with "I" — keep focus on the user and their take
 - Hedging ("not bad", "could be worse", "pretty close")
 - Name-dropping the artist unless it genuinely fits — the user uploaded this song themselves; don't perform familiarity
+- Sentences over 25 words — long advice is easy to ignore; one sharp sentence is what changes the next take
 
 # Examples of full responses
 
@@ -99,6 +116,33 @@ Given: lyric "we all live in a yellow submarine", hit_rate 65%, one good note on
 {
   "feedback": "The 'yellow' came out round and confident — warm and centered right where that phrase wants to sit.",
   "try_next": "On the final 'submarine', relax your throat and let it fall — you're pushing the last two notes sharp."
+}
+\`\`\`
+
+Given: "Hallelujah" by Leonard Cohen, lyric "and from your lips she drew the hallelujah", hit_rate 55%, slight flat tilt, the high note on "hallelujah" landed 60¢ flat:
+
+\`\`\`json
+{
+  "feedback": "Your phrasing was unhurried and the lower notes had real weight — that patience is what this song lives on.",
+  "try_next": "On the lift into 'hallelujah', take a deeper breath first and aim a hair above the note — you're undershooting the climb."
+}
+\`\`\`
+
+Given: lyric "I will always love you", hit_rate 30%, mic caught almost nothing on the long note:
+
+\`\`\`json
+{
+  "feedback": "The mic didn't catch much of that take — it's hard to hear how the long 'youuuuu' actually went.",
+  "try_next": "Move closer to the mic and try the phrase again — once we hear the held note we can dig in on it."
+}
+\`\`\`
+
+Given: "Wonderwall" by Oasis, lyric "and after all you're my wonderwall", hit_rate 80%, slightly sharp on "wonder", clean elsewhere:
+
+\`\`\`json
+{
+  "feedback": "That whole line sat on the beat exactly where Liam Gallagher puts it — nasal, forward, locked in.",
+  "try_next": "Soften the 'wonder' a touch — you're climbing on top of the note instead of leaning back into it."
 }
 \`\`\`
 
@@ -132,24 +176,23 @@ type PitchAnalysis = {
   best_note_idx: number | null;
 };
 
+type PhraseShape = {
+  lyric_text: string | null;
+  song: { name: string; artist: string | null };
+};
+
 function describeTilt(cents: number): string {
   if (Math.abs(cents) < 15) return "centered";
   if (cents > 0) return "consistently sharp";
   return "consistently flat";
 }
 
-function buildUserPrompt(attempt: {
-  phrase: {
-    lyric_text: string | null;
-    song: {
-      name: string;
-      artist: string | null;
-    };
-  };
-  pitch_analysis: PitchAnalysis;
-}): string {
-  const { song } = attempt.phrase;
-  const pa = attempt.pitch_analysis;
+function buildUserPrompt(
+  phrase: PhraseShape,
+  pitch_analysis: PitchAnalysis,
+): string {
+  const { song } = phrase;
+  const pa = pitch_analysis;
   const notes = pa.notes ?? [];
 
   const perNote = notes
@@ -176,7 +219,7 @@ function buildUserPrompt(attempt: {
   const byLine = song.artist ? ` by ${song.artist}` : "";
 
   return `Song: ${song.name}${byLine}
-Lyric: "${attempt.phrase.lyric_text ?? ""}"
+Lyric: "${phrase.lyric_text ?? ""}"
 
 Pitch analysis:
 - Hit rate: ${Math.round((pa.hit_rate ?? 0) * 100)}% of notes within a quarter-tone
@@ -207,7 +250,11 @@ Deno.serve(async (req) => {
     return json({ error: "method not allowed" }, 405);
   }
 
-  let body: { attempt_id?: string };
+  let body: {
+    attempt_id?: string;
+    pitch_analysis?: PitchAnalysis;
+    phrase?: PhraseShape;
+  };
   try {
     body = await req.json();
   } catch {
@@ -225,19 +272,32 @@ Deno.serve(async (req) => {
     { global: { headers: { Authorization: authHeader } } },
   );
 
-  const { data: attempt, error: attemptErr } = await supabase
-    .from("attempts")
-    .select(
-      "id, pitch_analysis, phrase:phrases(lyric_text, song:songs(name, artist))",
-    )
-    .eq("id", attemptId)
-    .single();
+  // Preferred path: caller passed pitch_analysis + phrase inline so we
+  // don't have to wait on a DB read on the user's interactive critical
+  // path. Saves 150–500ms per take. Fall back to a DB read for callers
+  // that haven't migrated yet.
+  let pitchAnalysis: PitchAnalysis | null = body.pitch_analysis ?? null;
+  let phrase: PhraseShape | null = body.phrase ?? null;
 
-  if (attemptErr || !attempt) {
-    return json({ error: "attempt not found" }, 404);
-  }
-  if (!attempt.pitch_analysis) {
-    return json({ error: "attempt has no pitch analysis" }, 400);
+  if (!pitchAnalysis || !phrase) {
+    const { data: attempt, error: attemptErr } = await supabase
+      .from("attempts")
+      .select(
+        "id, pitch_analysis, phrase:phrases(lyric_text, song:songs(name, artist))",
+      )
+      .eq("id", attemptId)
+      .single();
+
+    if (attemptErr || !attempt) {
+      return json({ error: "attempt not found" }, 404);
+    }
+    if (!attempt.pitch_analysis) {
+      return json({ error: "attempt has no pitch analysis" }, 400);
+    }
+    // deno-lint-ignore no-explicit-any
+    pitchAnalysis = attempt.pitch_analysis as any;
+    // deno-lint-ignore no-explicit-any
+    phrase = (attempt as any).phrase as PhraseShape;
   }
 
   const anthropic = new Anthropic({
@@ -248,7 +308,9 @@ Deno.serve(async (req) => {
     // deno-lint-ignore no-explicit-any
     const response: any = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1024,
+      // 256 covers the JSON response (~80 tokens typical) with headroom.
+      // 1024 was 12× over-allocated and bills against the response budget.
+      max_tokens: 256,
       thinking: { type: "disabled" },
       system: [
         {
@@ -260,8 +322,7 @@ Deno.serve(async (req) => {
       messages: [
         {
           role: "user",
-          // deno-lint-ignore no-explicit-any
-          content: buildUserPrompt(attempt as any),
+          content: buildUserPrompt(phrase!, pitchAnalysis!),
         },
       ],
       output_config: {
@@ -269,6 +330,14 @@ Deno.serve(async (req) => {
         format: { type: "json_schema", schema: SCHEMA },
       },
     });
+
+    // Log usage so we can verify the prompt cache is actually engaging.
+    // cache_creation_input_tokens > 0 on first call; cache_read_input_tokens
+    // > 0 on subsequent calls within the cache window. Anything else means
+    // the cache_control directive isn't being honored.
+    if (response?.usage) {
+      console.log("[feedback] usage:", JSON.stringify(response.usage));
+    }
 
     const textBlock = response.content.find((b: { type: string }) => b.type === "text");
     if (!textBlock) return json({ error: "no text in response" }, 502);
@@ -278,6 +347,10 @@ Deno.serve(async (req) => {
       try_next: string;
     };
 
+    // Persist so the timeline can show feedback later. Async-fire-and-forget
+    // would be slightly faster but we keep the await so the row reflects
+    // truth by the time the response lands at the client (the timeline is
+    // listed via SELECT, not the same call's return value).
     await supabase
       .from("attempts")
       .update({

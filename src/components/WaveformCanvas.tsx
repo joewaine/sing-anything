@@ -2,6 +2,7 @@ import { createElement, useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Platform, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import { PitchDetector } from 'pitchy';
+import { makeActiveNoteCursor } from '../lib/activeNoteCursor';
 import { getAudioContext } from '../lib/audioService';
 import type { MidiNote } from '../types';
 import { BORDER_1BIT, COLORS, GRID_BG, SHADOW_1BIT } from '../theme';
@@ -86,6 +87,9 @@ export default function WaveformCanvas({
     // Cached `t` between pitch-detection samples so the stroke color stays
     // stable without recomputing every frame.
     let cachedT = 1;
+    // Monotonic cursor — replaces a per-frame `notes.find(...)` linear
+    // scan (O(N) at 60Hz × 30+ notes was a measurable cost on Android).
+    const noteCursor = makeActiveNoteCursor(notes);
 
     const draw = () => {
       const { w, h } = sizeRef.current;
@@ -98,7 +102,8 @@ export default function WaveformCanvas({
       if (frame % PITCH_EVERY_N_FRAMES === 0) {
         let t = 1;
         const ms = currentMsRef.current ?? 0;
-        const expected = notes.find((n) => ms >= n.start_ms && ms < n.end_ms);
+        const idx = noteCursor(ms);
+        const expected = idx >= 0 ? notes[idx] : null;
         if (expected) {
           const [freq, clarity] = detector.findPitch(timeData, ctx.sampleRate);
           if (freq > 0 && clarity >= CLARITY_THRESHOLD) {

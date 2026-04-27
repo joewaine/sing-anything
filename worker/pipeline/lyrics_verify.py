@@ -27,6 +27,23 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 # If SequenceMatcher.ratio() is below this, we treat LRCLIB's result as a
 # mismatch rather than risk "correcting" whisper into something worse.
 LRCLIB_MIN_RATIO = 0.55
+# Above this ratio we trust LRCLIB enough to skip the Claude fallback —
+# saves a 2–4s LLM round trip on the critical path when the canonical
+# alignment is already strong.
+LRCLIB_HIGH_CONFIDENCE = 0.85
+
+# Module-level memoization so repeat catalog songs (same name+artist
+# uploaded by different users, or re-uploads) skip the LRCLIB and Claude
+# round trips entirely. Keyed by normalized (name, artist).
+_LYRICS_CACHE: dict[tuple[str, str], str | None] = {}
+_LYRICS_CACHE_MAX = 256
+
+
+def _cache_key(name: str | None, artist: str | None) -> tuple[str, str]:
+    return (
+        (name or "").strip().lower(),
+        (artist or "").strip().lower(),
+    )
 
 
 def _tokenize(text: str) -> list[str]:
@@ -49,7 +66,7 @@ def _tokens_with_original(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _lrclib_fetch(song_name: str, artist: str | None) -> Optional[str]:
+def _lrclib_fetch_uncached(song_name: str, artist: str | None) -> Optional[str]:
     import httpx
 
     try:
@@ -83,25 +100,57 @@ def _lrclib_fetch(song_name: str, artist: str | None) -> Optional[str]:
     return None
 
 
+def _lrclib_fetch(song_name: str, artist: str | None) -> Optional[str]:
+    """Memoized LRCLIB lookup. Same (name, artist) re-uploaded never hits the
+    network twice in this container's lifetime."""
+    key = _cache_key(song_name, artist)
+    if key in _LYRICS_CACHE:
+        return _LYRICS_CACHE[key]
+    if len(_LYRICS_CACHE) >= _LYRICS_CACHE_MAX:
+        # crude eviction — drop oldest insertion order entry
+        try:
+            _LYRICS_CACHE.pop(next(iter(_LYRICS_CACHE)))
+        except StopIteration:
+            pass
+    result = _lrclib_fetch_uncached(song_name, artist)
+    _LYRICS_CACHE[key] = result
+    return result
+
+
+def prefetch_lrclib(song_name: str | None, artist: str | None) -> None:
+    """Fire-and-forget: warm the cache for this song while other pipeline
+    stages run. Intended to be called from a thread early in process_song."""
+    if not song_name:
+        return
+    try:
+        _lrclib_fetch(song_name, artist)
+    except Exception as e:
+        print(f"[lyrics_verify] prefetch error: {e}")
+
+
 def _align_canonical(
     words: list[dict],
     canonical_text: str,
-) -> Optional[list[dict]]:
-    """Align canonical lyric tokens to whisper's word sequence. Returns a new
-    list with swapped `word` text if the alignment is good enough, else None."""
+) -> tuple[Optional[list[dict]], float]:
+    """Align canonical lyric tokens to whisper's word sequence.
+
+    Returns (corrected_words | None, ratio). The ratio is exposed so the
+    caller can skip the Claude fallback when LRCLIB is already
+    high-confidence (cuts a 2–4s LLM round trip).
+    """
     whisper_norms = [_tokenize(w["word"]) for w in words]
     whisper_tokens = [(toks[0] if toks else "") for toks in whisper_norms]
     canon_pairs = _tokens_with_original(canonical_text)
     canon_tokens = [p[0] for p in canon_pairs]
 
     if not canon_tokens or not whisper_tokens:
-        return None
+        return None, 0.0
 
     matcher = difflib.SequenceMatcher(None, whisper_tokens, canon_tokens)
     ratio = matcher.ratio()
     print(f"[lyrics_verify] lrclib ratio={ratio:.2f} whisper={len(whisper_tokens)} canon={len(canon_tokens)}")
     if ratio < LRCLIB_MIN_RATIO:
-        return None
+        return None, ratio
 
     corrected = [dict(w) for w in words]
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -125,7 +174,7 @@ def _align_canonical(
         # we leave whisper's original text. Mismatch is usually background
         # vocals / repeated choruses — safer to keep whisper than invent words.
 
-    return corrected
+    return corrected, ratio
 
 
 def _claude_fetch(words: list[dict], song_name: str, artist: str | None) -> Optional[list[dict]]:
@@ -200,15 +249,26 @@ def verify_lyrics(
     artist: str | None,
 ) -> tuple[list[dict], str]:
     """Return (possibly-corrected words, source). Source is one of
-    'lrclib' | 'claude' | 'none'."""
+    'lrclib' | 'claude' | 'none'.
+
+    Skips the Claude fallback when LRCLIB returned a high-confidence match
+    (alignment ratio >= LRCLIB_HIGH_CONFIDENCE) — Claude can't meaningfully
+    improve on canonical lyrics that already aligned cleanly, and the LLM
+    round trip is the most expensive thing in this function.
+    """
     if not song_name or not words:
         return words, "none"
 
     canonical = _lrclib_fetch(song_name, artist)
     if canonical:
-        aligned = _align_canonical(words, canonical)
+        aligned, ratio = _align_canonical(words, canonical)
         if aligned is not None:
             return aligned, "lrclib"
+        if ratio >= LRCLIB_HIGH_CONFIDENCE:
+            # LRCLIB has the song with high confidence but our matcher
+            # tripped on something — still skip Claude (it'd see the same
+            # whisper text and be tempted to over-correct).
+            return words, "none"
 
     claude_fixed = _claude_fetch(words, song_name, artist)
     if claude_fixed is not None:

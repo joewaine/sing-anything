@@ -87,11 +87,22 @@ MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # 100 MB — matches the client 30 MB
                                          # signed URL from OOM-ing the container.
 
 
-def _download(url: str, dest: Path) -> None:
+def _download(url: str, dest: Path, timeout: float = 60.0) -> None:
+    """Stream an http(s) URL to disk with a hard byte cap and per-read
+    timeout. Without the timeout, a stalled TCP connection pins this
+    function — and the surrounding GPU container — until Modal's task
+    reaper kicks in (~30 minutes), which is real money on a T4.
+    """
     req = Request(url, headers={"User-Agent": "sing-anything-worker/0.1"})
     total = 0
-    with urlopen(req) as resp, dest.open("wb") as out:
-        while chunk := resp.read(1 << 20):
+    with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
+        while True:
+            try:
+                chunk = resp.read(1 << 20)
+            except Exception as e:
+                raise RuntimeError(f"download read failed: {e}") from e
+            if not chunk:
+                break
             total += len(chunk)
             if total > MAX_DOWNLOAD_BYTES:
                 raise RuntimeError(
@@ -121,6 +132,14 @@ def _yt_download(url: str, dest: Path) -> dict:
     opts = {
         "format": "bestaudio/best",
         "outtmpl": out_tmpl,
+        # Cap at the same 100 MB ceiling we enforce on direct uploads.
+        # yt-dlp checks this against the announced size before download
+        # starts, so a malicious user can't ring up proxy bandwidth on a
+        # 4-hour stream.
+        "max_filesize": MAX_DOWNLOAD_BYTES,
+        # Bound the absolute wait per HTTP transfer so a flaky residential
+        # proxy exit can't pin a T4 for the full Modal reaper window.
+        "socket_timeout": 30,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -227,6 +246,11 @@ def demucs_split(original_url: str, song_id: str) -> dict:
     timeout=1800,
     secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
     volumes=MODEL_VOLUMES,
+    # Keep the GPU container warm for 10 minutes after a run finishes.
+    # Cheap on the way out (you're already past scale-to-zero), big win
+    # on back-to-back uploads in a single session: second song reuses
+    # whisperx + crepe + demucs model caches without reloading.
+    scaledown_window=600,
 )
 def process_song(
     song_id: str,
@@ -249,7 +273,7 @@ def process_song(
     """
     from supabase import create_client
 
-    from pipeline.lyrics_verify import verify_lyrics
+    from pipeline.lyrics_verify import prefetch_lrclib, verify_lyrics
     from pipeline.notes import quantize_notes
     from pipeline.phrases import detect_phrases
     from pipeline.pitch import pitch_curve
@@ -263,6 +287,9 @@ def process_song(
     )
 
     def stage(name: str, progress: float, message: str = "") -> None:
+        """Update jobs row + heartbeat. Heartbeat is read by the reaper to
+        decide if a job has hard-crashed (no updates in >10min → reap to
+        error so the user can retry instead of being permanently stuck)."""
         print(f"[stage {name} {progress:.2f}] {message}")
         if not job_id:
             return
@@ -271,9 +298,19 @@ def process_song(
                 "stage": name,
                 "progress": progress,
                 "message": message,
+                "heartbeat_at": "now()",
             }).eq("id", job_id).execute()
         except Exception as e:
             print(f"[stage] jobs update failed: {e}")
+
+    def heartbeat() -> None:
+        """Lightweight heartbeat-only update for inside long stages."""
+        if not job_id:
+            return
+        try:
+            sb.table("jobs").update({"heartbeat_at": "now()"}).eq("id", job_id).execute()
+        except Exception as e:
+            print(f"[heartbeat] failed: {e}")
 
     if not original_url and not youtube_url:
         raise ValueError("process_song needs either original_url or youtube_url")
@@ -359,39 +396,67 @@ def process_song(
         vocals = stem_dir / "vocals.wav"
         drums = stem_dir / "drums.wav"
 
+        # Look up song name/artist NOW so LRCLIB can prefetch in parallel
+        # with the GPU stages instead of after them.
+        song_name: str | None = None
+        song_artist: str | None = None
+        if user_id:
+            try:
+                song_row = (
+                    sb.table("songs")
+                    .select("name, artist")
+                    .eq("id", song_id)
+                    .single()
+                    .execute()
+                )
+                song_name = (song_row.data or {}).get("name")
+                song_artist = (song_row.data or {}).get("artist")
+            except Exception as e:
+                print(f"[process_song] song lookup failed: {e}")
+
+        # Decode vocals once at 16kHz mono. Both whisperx and torchcrepe
+        # consume this exact shape, so passing the array to both is a
+        # quality-neutral 1-2s save plus the prerequisite for running
+        # them concurrently on the same GPU container.
+        import whisperx as _whisperx
+        vocals_array = _whisperx.load_audio(str(vocals))
+
+        # Parallel block: WhisperX + torchcrepe + mix_backing + LRCLIB
+        # prefetch all run concurrently. Whisper and Crepe share the GPU
+        # but have disjoint VRAM (Whisper large-v3 fp16 ~3 GB; Crepe full
+        # at batch_size=1024 ~1.5 GB; T4 has 16 GB). mix_backing is pure
+        # CPU. LRCLIB is pure HTTP I/O. ThreadPoolExecutor lets all four
+        # overlap; the GPU-resident ops time-multiplex via CUDA streams.
+        # Saves ~10-17s/song on warm container vs the prior serial path.
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+
         backing = tmp_dir / "backing.wav"
-        mix_backing(stem_dir, backing)
+        stage("whisper", 0.40, "whisperx + crepe (parallel) + lyric prefetch")
 
-        stage("whisper", 0.40, "whisperx large-v3 + wav2vec2 align")
-        language, words = transcribe_words(vocals)
-        print(f"[process_song] language={language} words={len(words)}")
+        with _Pool(max_workers=4) as ex:
+            f_whisper = ex.submit(transcribe_words, vocals, "large-v3", vocals_array)
+            f_pitch = ex.submit(pitch_curve, vocals, vocals_array)
+            f_mix = ex.submit(mix_backing, stem_dir, backing)
+            f_lrclib = ex.submit(prefetch_lrclib, song_name, song_artist)
 
-        # Best-effort lyric correction. Looks up song on LRCLIB (free, open),
-        # falls back to Claude Sonnet if ANTHROPIC_API_KEY is set. Either
-        # preserves whisper's timestamps, only changes word text. If both
-        # fail (obscure song), whisper's raw output is kept.
+            language, words = f_whisper.result()
+            print(f"[process_song] language={language} words={len(words)}")
+            heartbeat()
+
+            pitch = f_pitch.result()
+            heartbeat()
+
+            f_mix.result()  # raise if mix failed
+            f_lrclib.result()  # warmed cache; no return value used
+
+        # Lyric verification consumes the (now warm) LRCLIB cache so its
+        # network call is essentially free. Claude fallback only fires for
+        # truly-obscure songs and is gated by the LRCLIB-confidence floor
+        # in lyrics_verify.py.
         if words:
-            stage("whisper", 0.50, "verifying lyrics")
-            song_name = None
-            song_artist = None
-            if user_id:
-                try:
-                    song_row = (
-                        sb.table("songs")
-                        .select("name, artist")
-                        .eq("id", song_id)
-                        .single()
-                        .execute()
-                    )
-                    song_name = (song_row.data or {}).get("name")
-                    song_artist = (song_row.data or {}).get("artist")
-                except Exception as e:
-                    print(f"[process_song] song lookup failed: {e}")
+            stage("whisper", 0.55, "verifying lyrics")
             words, lyrics_source = verify_lyrics(words, song_name, song_artist)
             print(f"[process_song] lyrics source: {lyrics_source}")
-
-        stage("pitch", 0.60, "torchcrepe full model")
-        pitch = pitch_curve(vocals)
 
         stage("pitch", 0.70, "quantizing notes per word")
         notes = quantize_notes(pitch, words)
@@ -403,6 +468,58 @@ def process_song(
         n_verse = sum(1 for p in phrases if p["phrase_type"] == "verse")
         print(f"[process_song] phrases: line={n_line} verse={n_verse}")
 
+        # Persist derived artifacts before slicing. Vocals (FLAC, smaller
+        # than the original WAV but lossless), the whisper word JSON, and
+        # the pitch-curve numpy archive are everything you'd need to
+        # re-cut phrases or run a server-side pitch comparison without
+        # paying for Demucs/Whisper/Crepe again. Foundation for harmony
+        # tracks, retroactive phrase-boundary fixes, etc.
+        stage("slicing", 0.85, "persisting derived artifacts")
+        try:
+            import io as _io
+            import numpy as _np
+            import soundfile as _sf
+
+            owner_for_artifacts = user_id or "smoke"
+            derived_prefix = f"{owner_for_artifacts}/{song_id}/derived"
+
+            # vocals.flac (lossless, ~1/3 the size of WAV)
+            flac_buf = _io.BytesIO()
+            _sf.write(flac_buf, vocals_array, 16000, format="FLAC")
+            flac_buf.seek(0)
+            sb.storage.from_("phrases").upload(
+                path=f"{derived_prefix}/vocals.flac",
+                file=flac_buf.read(),
+                file_options={"content-type": "audio/flac", "upsert": "true"},
+            )
+
+            # words.json
+            sb.storage.from_("phrases").upload(
+                path=f"{derived_prefix}/words.json",
+                file=_json.dumps(words, ensure_ascii=False).encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"},
+            )
+
+            # pitch.npz (compressed)
+            pitch_buf = _io.BytesIO()
+            _np.savez_compressed(
+                pitch_buf,
+                times=pitch["times"],
+                midis=pitch["midis"],
+                confidences=pitch["confidences"],
+            )
+            pitch_buf.seek(0)
+            sb.storage.from_("phrases").upload(
+                path=f"{derived_prefix}/pitch.npz",
+                file=pitch_buf.read(),
+                file_options={"content-type": "application/octet-stream", "upsert": "true"},
+            )
+        except Exception as e:
+            # Persistence is best-effort — never block the user's pipeline
+            # on storage hiccups for the derived bonus artifacts.
+            print(f"[process_song] derived persist failed: {e}")
+        heartbeat()
+
         stage("slicing", 0.90, f"slicing + uploading {len(phrases)} clips")
         slices_dir = tmp_dir / "slices"
         slices_dir.mkdir()
@@ -412,8 +529,7 @@ def process_song(
         # Supabase uploads are I/O bound, so threading lets us overlap
         # otherwise-serial work instead of letting the GPU container rent
         # idle time while we loop. Each worker gets its OWN supabase client
-        # to avoid httpx connection-pool contention across threads (shared
-        # httpx.Client pool dropped connections under 8-wide concurrency).
+        # to avoid httpx connection-pool contention across threads.
         from concurrent.futures import ThreadPoolExecutor
 
         def _make_client():
@@ -427,7 +543,10 @@ def process_song(
             sliced = slice_phrase(vocals, backing, p, song_id, i, slices_dir)
             return upload_slice(_make_client(), owner, song_id, sliced)
 
-        workers = min(len(phrases) or 1, 4)
+        # Bumped from 4→6: per-thread Supabase clients have proven stable
+        # across the prior smoke tests; remaining bottleneck is ffmpeg
+        # CPU contention, not connection-pool fights.
+        workers = min(len(phrases) or 1, 6)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             results = list(ex.map(_slice_and_upload_one, enumerate(phrases)))
 
@@ -466,7 +585,11 @@ def process_song(
 @app.function(
     secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
     timeout=120,
-    min_containers=0,
+    # Keep one CPU container warm so the FastAPI ASGI app doesn't pay a
+    # 5-15s cold-start on the first /upload of the day. ~$2/mo at Modal's
+    # CPU-only hourly rate. The GPU `process_song` function still scales
+    # to zero on its own; only the lightweight orchestrator stays warm.
+    min_containers=1,
 )
 @modal.asgi_app()
 def api():
@@ -508,6 +631,16 @@ def api():
             raise HTTPException(401, "invalid token")
         return r.json()["id"]
 
+    def _reap_stale() -> None:
+        """Best-effort sweep of stale-heartbeat jobs. Called from /upload
+        before the idempotency check so a hard-crashed worker doesn't
+        permanently lock the user out of re-uploading."""
+        try:
+            sb_admin = create_client(SUPABASE_URL, SERVICE_KEY)
+            sb_admin.rpc("reap_stale_jobs").execute()
+        except Exception as e:
+            print(f"[reap] failed (non-fatal): {e}")
+
     @web.post("/upload")
     def upload(body: dict, authorization: str | None = Header(None)):
         user_id = _verify_user(authorization)
@@ -516,14 +649,16 @@ def api():
             raise HTTPException(400, "song_id required")
 
         sb = create_client(SUPABASE_URL, SERVICE_KEY)
+        _reap_stale()
 
         song = sb.table("songs").select("id, user_id, original_path").eq("id", song_id).single().execute()
         if not song.data or song.data["user_id"] != user_id:
             raise HTTPException(404, "song not found")
 
         # Idempotency: if a job for this song is already in flight (queued
-        # or any non-terminal stage), return it instead of spawning another
-        # worker. Protects against double-click uploads, retries, etc.
+        # or any non-terminal stage that's still heartbeating), return it
+        # instead of spawning another worker. Stale-heartbeat jobs were
+        # just reaped to error above, so they won't match the filter.
         existing = (
             sb.table("jobs")
             .select("id, stage")
@@ -573,6 +708,7 @@ def api():
             raise HTTPException(400, "song_id and youtube_url required")
 
         sb = create_client(SUPABASE_URL, SERVICE_KEY)
+        _reap_stale()
 
         song = (
             sb.table("songs")

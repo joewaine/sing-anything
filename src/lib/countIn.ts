@@ -21,6 +21,11 @@ export type CountInOptions = {
   vocalsUrl?: string | null;
   vocalsEnabled?: boolean;
   vocalsVolume?: number;
+  /** Stable cache key for the buffer cache. Pass a value derived from
+   *  `(song_id, phrase_id, stem)` so re-signed signed URLs still hit the
+   *  same decoded buffer. */
+  backingCacheKey?: string;
+  vocalsCacheKey?: string;
   onBeat?: (beatNumber: number) => void;
   onBackingStart?: () => void;
   onPositionMs?: (ms: number) => void;
@@ -55,6 +60,8 @@ export async function startCountInAndBacking(
     vocalsUrl = null,
     vocalsEnabled = true,
     vocalsVolume = 0.85,
+    backingCacheKey,
+    vocalsCacheKey,
     onBeat,
     onBackingStart,
     onPositionMs,
@@ -69,13 +76,13 @@ export async function startCountInAndBacking(
   // Preload buffers in parallel (cache-hit if already warmed during Listen).
   const [backing, vocals] = await Promise.all([
     backingUrl
-      ? getDecodedBuffer(backingUrl).catch((e) => {
+      ? getDecodedBuffer(backingUrl, backingCacheKey).catch((e) => {
           console.warn('backing load failed:', e);
           return null;
         })
       : Promise.resolve(null),
     vocalsUrl
-      ? getDecodedBuffer(vocalsUrl).catch((e) => {
+      ? getDecodedBuffer(vocalsUrl, vocalsCacheKey).catch((e) => {
           console.warn('vocals load failed:', e);
           return null;
         })
