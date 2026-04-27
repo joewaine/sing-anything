@@ -120,10 +120,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       backingEnabled: s.backingEnabled,
       backingVolume: s.backingVolume,
       vocalsEnabled: s.leadVocalEnabled,
-      // Pre-roll backing audio before vocals enter — gives the singer
-      // a moment to feel the groove. Applies on every fresh loop
-      // start (initial preview + after each Record count-in).
-      leadInSec: 1.5,
+      // No client-side leadInSec: the worker now bakes a real
+      // vocal-free lead-in into the audio file (see slice.py
+      // LEAD_IN_MS). Old songs processed before that change have
+      // no lead-in — re-upload them to pick it up.
       onPositionMs: (ms) => {
         currentMsRef.current = ms;
       },

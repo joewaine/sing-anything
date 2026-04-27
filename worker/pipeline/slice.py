@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 CLIP_PAD_MS = 150
+# Vocal-free musical lead-in (ms). Backing slice covers this entire
+# range as real song audio; vocals slice has these first ms muted.
+# Keep in sync with phrases.LEAD_IN_MS — they must match exactly so
+# clip_offset and the ffmpeg cut start agree on the same anchor.
+LEAD_IN_MS = 2000
 UPLOAD_MAX_RETRIES = 3
 UPLOAD_BACKOFF_BASE_S = 0.5
 
@@ -34,22 +39,52 @@ def slice_phrase(
     label = _slugify(phrase.get("lyric_text") or f"phrase-{idx:03d}")
     slug = f"{song_id[:8]}-{phrase['phrase_type']}-{idx:03d}-{label}"
 
-    start_s = max(0.0, (phrase["start_ms"] - CLIP_PAD_MS) / 1000.0)
+    # Lead-in span (clamped at song-start). Match the formula in
+    # phrases.clip_offset so the clip starts where notes are anchored.
+    raw_start_ms = phrase["start_ms"] - CLIP_PAD_MS - LEAD_IN_MS
+    actual_lead_in_ms = max(0, min(LEAD_IN_MS, phrase["start_ms"] - CLIP_PAD_MS))
+    start_s = max(0.0, raw_start_ms / 1000.0)
     end_s = (phrase["end_ms"] + CLIP_PAD_MS) / 1000.0
+    mute_until_s = actual_lead_in_ms / 1000.0
 
     vocals_out = out_dir / f"{slug}__vocals.ogg"
     backing_out = out_dir / f"{slug}__backing.ogg"
 
-    for src, dest in [(vocals_path, vocals_out), (backing_path, backing_out)]:
-        subprocess.check_call([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{start_s:.3f}",
-            "-to", f"{end_s:.3f}",
-            "-i", str(src),
-            "-c:a", "libvorbis",
-            "-q:a", "6",
-            str(dest),
-        ])
+    # Backing: straight slice — the lead-in segment plays as real song
+    # audio (whatever was in the song before this phrase started).
+    subprocess.check_call([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start_s:.3f}",
+        "-to", f"{end_s:.3f}",
+        "-i", str(backing_path),
+        "-c:a", "libvorbis",
+        "-q:a", "6",
+        str(backing_out),
+    ])
+
+    # Vocals: slice the same span, but mute the first actual_lead_in_ms
+    # using ffmpeg's volume filter with `enable='lt(t,N)'`. The filter
+    # multiplies samples by 0 when t < N (within the lead-in) and is a
+    # no-op afterwards — leaving the original vocal stem intact.
+    vocals_filter = (
+        f"volume=0:enable='lt(t,{mute_until_s:.3f})'"
+        if mute_until_s > 0
+        else None
+    )
+    vocals_cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start_s:.3f}",
+        "-to", f"{end_s:.3f}",
+        "-i", str(vocals_path),
+    ]
+    if vocals_filter:
+        vocals_cmd += ["-af", vocals_filter]
+    vocals_cmd += [
+        "-c:a", "libvorbis",
+        "-q:a", "6",
+        str(vocals_out),
+    ]
+    subprocess.check_call(vocals_cmd)
 
     return {**phrase, "slug": slug, "_vocals_local": vocals_out, "_backing_local": backing_out}
 

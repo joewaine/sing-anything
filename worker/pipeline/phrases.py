@@ -31,10 +31,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# IMPORTANT: keep in sync with slice.py — when ffmpeg produces a clip it
-# starts max(0, phrase_start - CLIP_PAD_MS) into the original audio. Note
-# timestamps below are made relative to that same clip start.
+# IMPORTANT: keep these in sync with slice.py — when ffmpeg produces a
+# clip it starts max(0, phrase_start - CLIP_PAD_MS - LEAD_IN_MS) into the
+# original audio. Note timestamps below are made relative to that same
+# clip start.
 CLIP_PAD_MS = 150
+
+# Vocal-free musical lead-in (ms) prepended to every phrase clip. The
+# backing slice covers this entire range as real song audio, but the
+# vocals slice has its first LEAD_IN_MS muted. Result: the user hears
+# 2s of just-instrumental backing (real song context) before the vocal
+# entry, giving them a beat to ground themselves in the music.
+# 0 = no lead-in (matches the pre-existing behavior).
+LEAD_IN_MS = 2000
 
 # Phrase boundary heuristic: when a singer takes a breath between lines
 # they typically pause >800ms. Tightening this lower (300-500ms) would
@@ -110,7 +119,15 @@ def detect_phrases(
     raw_lines = _build_lines(words)
 
     def clip_offset(phrase_start_ms: int) -> int:
-        return max(0, phrase_start_ms - CLIP_PAD_MS)
+        # Clip starts CLIP_PAD_MS + LEAD_IN_MS before the phrase's first
+        # sung syllable, clamped at song-start.
+        return max(0, phrase_start_ms - CLIP_PAD_MS - LEAD_IN_MS)
+
+    def clip_duration(phrase_start_ms: int, phrase_end_ms: int) -> int:
+        # Total duration of the audio clip ffmpeg will emit. = lead-in
+        # (full LEAD_IN_MS or less for early phrases) + CLIP_PAD_MS +
+        # phrase_dur + CLIP_PAD_MS. Used as loopDuration on the client.
+        return phrase_end_ms + CLIP_PAD_MS - clip_offset(phrase_start_ms)
 
     def notes_in_window(start_ms: int, end_ms: int) -> list[dict]:
         clip0 = clip_offset(start_ms)
@@ -133,7 +150,10 @@ def detect_phrases(
         lines.append({
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "duration_ms": duration_ms,
+            # duration_ms is the full audio-clip length now, including the
+            # vocal-free lead-in + CLIP_PAD on each side. The client uses
+            # this as loop length so the lead-in plays inside every loop.
+            "duration_ms": clip_duration(start_ms, end_ms),
             "phrase_type": "line",
             "lyric_text": lyric_text,
             "notes": notes_in_window(start_ms, end_ms),
@@ -187,7 +207,7 @@ def detect_phrases(
             verses.append({
                 "start_ms": verse_start,
                 "end_ms": verse_end,
-                "duration_ms": verse_end - verse_start,
+                "duration_ms": clip_duration(verse_start, verse_end),
                 "phrase_type": "verse",
                 "lyric_text": " ".join(g["lyric_text"] for g in group if g["lyric_text"]),
                 "notes": verse_notes,
