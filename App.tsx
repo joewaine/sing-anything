@@ -22,6 +22,38 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [route, setRoute] = useState<Route>(() => currentHashRoute() ?? { screen: 'welcome' });
 
+  // /debug auto-login. Hitting #/debug triggers signInWithPassword for the
+  // owner email so dev iterations don't require a fresh magic link each
+  // visit. Password lives in EXPO_PUBLIC_DEBUG_PASSWORD on Render's env;
+  // route is unlisted on purpose. Anyone who guesses the URL gets in,
+  // so we don't put privileged data behind this account — same trust
+  // model as a localStorage-backed cookie.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const hash = window.location.hash.replace(/^#/, '');
+    if (hash !== '/debug') return;
+    if (!hasSupabaseConfig) return;
+
+    const password = process.env.EXPO_PUBLIC_DEBUG_PASSWORD;
+    if (!password) {
+      setError('EXPO_PUBLIC_DEBUG_PASSWORD not set in env — /debug disabled.');
+      return;
+    }
+    const supabase = requireSupabase();
+    void (async () => {
+      const { error: signInErr } = await supabase.auth.signInWithPassword({
+        email: 'joe.waine@gmail.com',
+        password,
+      });
+      if (signInErr) {
+        setError(`Debug auth failed: ${signInErr.message}`);
+        return;
+      }
+      window.history.replaceState({}, '', '#/library');
+      setRoute({ screen: 'library' });
+    })();
+  }, []);
+
   // Source of truth for "are we signed in?" is Supabase's session. On cold
   // load, supabase-js parses the URL hash for magic-link tokens (we
   // configured `detectSessionInUrl: true` in supabase.ts), then fires

@@ -120,6 +120,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       backingEnabled: s.backingEnabled,
       backingVolume: s.backingVolume,
       vocalsEnabled: s.leadVocalEnabled,
+      // Pre-roll backing audio before vocals enter — gives the singer
+      // a moment to feel the groove. Applies on every fresh loop
+      // start (initial preview + after each Record count-in).
+      leadInSec: 1.5,
       onPositionMs: (ms) => {
         currentMsRef.current = ms;
       },
@@ -142,9 +146,23 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       // Permission not granted yet — recorder.prepare() will surface
       // a friendly error if Record is pressed before access is allowed.
     });
-    const handle = await startLoopFromZero();
-    if (handle) setStage('playing');
-  }, [startLoopFromZero]);
+    // Count-in on first arrival too, not just when Record is pressed.
+    // The user wants a moment to settle into the tempo before the
+    // phrase begins playing.
+    setStage('countdown');
+    setCountdown(4);
+    const bpm = phrase.tempo_bpm ?? 120;
+    countInRef.current = startCountIn({
+      bpm,
+      beats: 4,
+      onBeat: (n) => setCountdown(5 - n),
+      onComplete: async () => {
+        countInRef.current = null;
+        const handle = await startLoopFromZero();
+        if (handle) setStage('playing');
+      },
+    });
+  }, [phrase, startLoopFromZero]);
 
   useEffect(() => {
     void startInitialLoop();

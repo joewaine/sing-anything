@@ -34,6 +34,14 @@ export type PhraseLoopOptions = {
   backingVolume?: number;
   vocalsEnabled?: boolean;
   vocalsVolume?: number;
+  /** Pre-roll (seconds) of backing-only audio before the phrase begins.
+   *  We achieve this by starting the looping backing source from
+   *  buffer position (duration - leadInSec) — so the loop's tail
+   *  plays first, then wraps to position 0 and the phrase begins
+   *  proper. Vocals start delayed by leadInSec so they enter aligned
+   *  with backing[0]. After the first wrap both sources stay locked
+   *  in sync. 0 = no lead-in (start clean). */
+  leadInSec?: number;
   onPositionMs?: (ms: number) => void;
 };
 
@@ -66,6 +74,24 @@ export async function startPhraseLoop(
   const startAt = ctx.currentTime + 0.05;
   const loopDur = Math.max(0.5, opts.loopDurationSec);
 
+  // Lead-in: we want some backing-only audio to play before the vocal
+  // entry. Trick: start the backing source from buffer position
+  // (duration - leadInSec) with loop=true. The Web Audio spec wraps
+  // back to loopStart=0 when the source reaches the buffer end, so the
+  // tail of the buffer plays first as a "lead-in", then the buffer
+  // wraps and plays normally from t=0. Vocals are scheduled to start
+  // at startAt + leadInSec so they enter exactly at backing[0]. After
+  // the first wrap both sources stay locked, no per-wrap fixup needed.
+  const leadInSec = Math.max(0, opts.leadInSec ?? 0);
+  const backingDur = backing?.duration ?? loopDur;
+  const backingOffset =
+    leadInSec > 0 && backingDur > leadInSec ? backingDur - leadInSec : 0;
+  // Audio anchor: when does buffer position 0 (start of phrase proper)
+  // become audible? That's startAt + leadInSec. Used by the position
+  // clock and onNextLoopStart so visuals + recording align with the
+  // phrase, not with the lead-in.
+  const phraseStartAt = startAt + leadInSec;
+
   let backingVolume = opts.backingVolume ?? 0.7;
   let backingEnabled = opts.backingEnabled ?? true;
   let vocalsEnabled = opts.vocalsEnabled ?? true;
@@ -80,7 +106,7 @@ export async function startPhraseLoop(
     backingGain = ctx.createGain();
     backingGain.gain.value = backingEnabled ? backingVolume : 0;
     backingSource.connect(backingGain).connect(ctx.destination);
-    backingSource.start(startAt);
+    backingSource.start(startAt, backingOffset);
   }
 
   let vocalsSource: AudioBufferSourceNode | null = null;
@@ -92,7 +118,8 @@ export async function startPhraseLoop(
     vocalsGain = ctx.createGain();
     vocalsGain.gain.value = vocalsEnabled ? vocalsVolume : 0;
     vocalsSource.connect(vocalsGain).connect(ctx.destination);
-    vocalsSource.start(startAt);
+    // Vocals start at the moment backing wraps to position 0.
+    vocalsSource.start(phraseStartAt);
   }
 
   const armedTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -114,7 +141,10 @@ export async function startPhraseLoop(
   const tick = () => {
     if (stopped) return;
     const audibleNow = ctx.currentTime - outputLatency;
-    const elapsed = Math.max(0, audibleNow - startAt);
+    // During the lead-in (audibleNow < phraseStartAt) we report 0 so
+    // the visual cursor sits at the start of the phrase. After the
+    // lead-in completes the position counts up modulo loopDur.
+    const elapsed = Math.max(0, audibleNow - phraseStartAt);
     const ms = (((elapsed % loopDur) + loopDur) % loopDur) * 1000;
     opts.onPositionMs?.(ms);
     rafId = requestAnimationFrame(tick);
@@ -151,9 +181,12 @@ export async function startPhraseLoop(
       if (vocalsGain) ramp(vocalsGain, enabled ? vocalsVolume : 0);
     },
     onNextLoopStart(cb) {
-      const elapsed = ctx.currentTime - startAt;
+      // Loop boundaries are at phraseStartAt + N*loopDur (the lead-in
+      // happens once at the very start; subsequent wraps are at the
+      // phrase's t=0).
+      const elapsed = ctx.currentTime - phraseStartAt;
       const completedLoops = Math.max(0, Math.floor(elapsed / loopDur));
-      const nextLoopAt = startAt + (completedLoops + 1) * loopDur;
+      const nextLoopAt = phraseStartAt + (completedLoops + 1) * loopDur;
       const delayMs = Math.max(0, (nextLoopAt - ctx.currentTime) * 1000);
       let cancelled = false;
       const timer = setTimeout(() => {
@@ -168,13 +201,13 @@ export async function startPhraseLoop(
       };
     },
     getMsUntilNextLoop() {
-      const elapsed = ctx.currentTime - startAt;
+      const elapsed = ctx.currentTime - phraseStartAt;
       const completedLoops = Math.max(0, Math.floor(elapsed / loopDur));
-      const nextLoopAt = startAt + (completedLoops + 1) * loopDur;
+      const nextLoopAt = phraseStartAt + (completedLoops + 1) * loopDur;
       return Math.max(0, (nextLoopAt - ctx.currentTime) * 1000);
     },
     getPositionMs() {
-      const elapsed = ctx.currentTime - startAt;
+      const elapsed = Math.max(0, ctx.currentTime - phraseStartAt);
       return (((elapsed % loopDur) + loopDur) % loopDur) * 1000;
     },
   };
