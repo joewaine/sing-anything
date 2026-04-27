@@ -92,18 +92,34 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     setMicStream(null);
   }, []);
 
+  // settingsRef mirrors the user's toggle/volume state. We can't read
+  // state directly in startLoopFromZero — it's a useCallback whose
+  // closure would otherwise capture stale values, so toggling during
+  // preview wouldn't carry into the recording-stage loop. Refs
+  // sidestep that without making the callback ref churn on every
+  // setting change.
+  const settingsRef = useRef({
+    backingEnabled,
+    backingVolume,
+    leadVocalEnabled,
+  });
+  useEffect(() => {
+    settingsRef.current = { backingEnabled, backingVolume, leadVocalEnabled };
+  }, [backingEnabled, backingVolume, leadVocalEnabled]);
+
   const startLoopFromZero = useCallback(async () => {
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
+    const s = settingsRef.current;
     const handle = await startPhraseLoop({
       backingUrl: phrase.backing_url,
       vocalsUrl: phrase.vocals_url,
       loopDurationSec: phrase.duration_ms / 1000,
       backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
       vocalsCacheKey: `${phrase.song_id}:${phrase.id}:vocals`,
-      backingEnabled,
-      backingVolume,
-      vocalsEnabled: leadVocalEnabled,
+      backingEnabled: s.backingEnabled,
+      backingVolume: s.backingVolume,
+      vocalsEnabled: s.leadVocalEnabled,
       onPositionMs: (ms) => {
         currentMsRef.current = ms;
       },
@@ -115,7 +131,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
     phraseLoopRef.current = handle;
     return handle;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phrase]);
 
   const startInitialLoop = useCallback(async () => {
