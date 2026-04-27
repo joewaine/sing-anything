@@ -28,12 +28,7 @@ type Props = {
 const HEIGHT = 130;
 const PAD_TOP = 12;
 const PAD_BOTTOM = 26;
-// Note pill height is now derived per-render from the visible semitone
-// step (see geometry useMemo) so a 1-semitone pitch difference looks
-// exactly one pill-height tall on screen — making the piano roll's
-// vertical spacing meaningful rather than decorative.
-const MIN_NOTE_HEIGHT = 6;
-const MAX_NOTE_HEIGHT = 16;
+const NOTE_HEIGHT = 14;
 
 const MARQUEE_THRESHOLD_MS = 10_000;
 const PX_PER_SEC = 80;
@@ -44,7 +39,6 @@ type NoteGeom = {
   x: number;
   w: number;
   y: number;
-  h: number;
   lyric: string;
   gradient: string;
   startMs: number;
@@ -66,7 +60,6 @@ function NotesLayer({ geometry }: { geometry: NoteGeom[] }) {
               {
                 width: g.w,
                 top: g.y,
-                height: g.h,
                 backgroundImage: g.gradient,
               } as any,
             ]}
@@ -74,7 +67,7 @@ function NotesLayer({ geometry }: { geometry: NoteGeom[] }) {
           {g.lyric ? (
             <Text
               numberOfLines={1}
-              style={[styles.lyric, { top: g.h + 4, left: -20, width: g.w + 40 }]}
+              style={[styles.lyric, { left: -20, width: g.w + 40 }]}
             >
               {g.lyric}
             </Text>
@@ -125,52 +118,25 @@ export default function PitchRibbon({
     ? (durationMs / 1000) * PX_PER_SEC
     : containerWidth;
 
-  // Pixel-per-semitone for the current visible pitch range. Drives note
-  // pill height + the semitone grid lines so vertical distance on screen
-  // = real pitch distance.
-  const drawHeight = HEIGHT - PAD_TOP - PAD_BOTTOM;
-  const semitoneStep = drawHeight / pitchRange;
-  const noteHeight = Math.min(
-    MAX_NOTE_HEIGHT,
-    Math.max(MIN_NOTE_HEIGHT, semitoneStep),
-  );
-
   const geometry = useMemo<NoteGeom[]>(() => {
     if (innerWidth === 0 || durationMs <= 0) return [];
+    const drawHeight = HEIGHT - PAD_TOP - PAD_BOTTOM;
     return notes.map((n, i) => {
       const x = Math.max(0, Math.min(innerWidth, (n.start_ms / durationMs) * innerWidth));
       const end = Math.max(0, Math.min(innerWidth, (n.end_ms / durationMs) * innerWidth));
       const normalized = (n.pitch_midi - minPitch + 1) / pitchRange;
-      const y = PAD_TOP + (1 - normalized) * drawHeight - noteHeight / 2;
+      const y = PAD_TOP + (1 - normalized) * drawHeight - NOTE_HEIGHT / 2;
       return {
         x,
         w: Math.max(4, end - x),
         y,
-        h: noteHeight,
         lyric: n.lyric ?? '',
         gradient: NOTE_GRADIENTS[i % NOTE_GRADIENTS.length],
         startMs: n.start_ms,
         endMs: n.end_ms,
       };
     });
-  }, [notes, innerWidth, durationMs, minPitch, pitchRange, drawHeight, noteHeight]);
-
-  // One faint horizontal line per semitone within the visible range.
-  // Lets the eye verify "this note is two steps higher than that one"
-  // — without the grid the y-axis is mostly decorative.
-  const semitoneLines = useMemo(() => {
-    if (drawHeight <= 0 || pitchRange <= 0) return [] as { y: number; bold: boolean }[];
-    const lines: { y: number; bold: boolean }[] = [];
-    for (let s = 0; s <= pitchRange; s++) {
-      const midi = minPitch - 1 + s;
-      const normalized = s / pitchRange;
-      const y = PAD_TOP + (1 - normalized) * drawHeight;
-      // Bold every 12 semitones (octave). Slight visual anchor for
-      // larger phrases.
-      lines.push({ y, bold: midi % 12 === 0 });
-    }
-    return lines;
-  }, [minPitch, pitchRange, drawHeight]);
+  }, [notes, innerWidth, durationMs, minPitch, pitchRange]);
 
   const playheadX = containerWidth * PLAYHEAD_FRACTION;
 
@@ -213,17 +179,7 @@ export default function PitchRibbon({
   return (
     <View style={styles.container} onLayout={onLayout}>
       <View style={styles.gridLayer} />
-      {/* Per-semitone horizontal grid. The mid-line was decorative; this
-          replaces it with one line per semitone in the visible range so
-          the eye can read pitch distance directly off the canvas.
-          Octaves are bolder. */}
-      {semitoneLines.map((line, i) => (
-        <View
-          key={`semi-${i}`}
-          pointerEvents="none"
-          style={[styles.semitoneLine, line.bold && styles.semitoneLineOctave, { top: line.y }]}
-        />
-      ))}
+      <View style={styles.midLine} />
 
       {useMarquee && active && containerWidth > 0 && (
         <View
@@ -283,7 +239,6 @@ function ActiveOverlay({ geom }: { geom: NoteGeom }) {
           {
             width: geom.w,
             top: geom.y,
-            height: geom.h,
             backgroundImage: geom.gradient,
           } as any,
         ]}
@@ -294,7 +249,7 @@ function ActiveOverlay({ geom }: { geom: NoteGeom }) {
           style={[
             styles.lyric,
             styles.lyricActive,
-            { top: geom.h + 4, left: -20, width: geom.w + 40 },
+            { left: -20, width: geom.w + 40 },
           ]}
         >
           {geom.lyric}
@@ -332,17 +287,6 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.black,
     opacity: 0.25,
   },
-  semitoneLine: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    height: 1,
-    backgroundColor: COLORS.black,
-    opacity: 0.08,
-  },
-  semitoneLineOctave: {
-    opacity: 0.22,
-  },
   playheadBand: {
     position: 'absolute',
     top: 0,
@@ -354,10 +298,7 @@ const styles = StyleSheet.create({
   },
   notePill: {
     position: 'absolute',
-    // height is set per-instance from geometry (one semitone step) so
-    // pitch distance reads correctly off the canvas. Default for any
-    // legacy callers that pass no height; production paths override.
-    height: MIN_NOTE_HEIGHT,
+    height: NOTE_HEIGHT,
     borderRadius: 9999,
     ...BORDER_1BIT,
     ...SHADOW_1BIT,
@@ -368,8 +309,7 @@ const styles = StyleSheet.create({
   } as any,
   lyric: {
     position: 'absolute',
-    // top is set per-instance from geometry; default kept for legacy.
-    top: MIN_NOTE_HEIGHT + 4,
+    top: NOTE_HEIGHT + 4,
     textAlign: 'center',
     fontFamily: FONTS.monaco,
     fontSize: 11,

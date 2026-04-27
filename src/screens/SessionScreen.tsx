@@ -6,6 +6,7 @@ import PitchRibbon from '../components/PitchRibbon';
 import LyricStrip from '../components/LyricStrip';
 import WaveformCanvas from '../components/WaveformCanvas';
 import RetroButton from '../components/RetroButton';
+import BeatBall from '../components/BeatBall';
 import { type PhraseWithSong } from '../lib/phrases';
 import { uploadAndInsert, runAnalysisAndSave } from '../lib/attempts';
 import { feedbackInlineFor, requestFeedback, type FeedbackResult } from '../lib/feedback';
@@ -13,6 +14,7 @@ import { createRecorder, primeMicPermission, type Recorder } from '../lib/record
 import { startCountInAndBacking, type CountInHandleWithVocals } from '../lib/countIn';
 import { prefetchBuffer } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
+import { useBackingVolume, nextStep } from '../lib/backingVolume';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 type Stage =
@@ -28,7 +30,6 @@ type Props = {
   onBack: () => void;
 };
 
-const BACKING_VOLUME = 0.55;
 const STAGE_LABELS: Record<Exclude<Stage, 'error'>, string> = {
   idle: 'Ready',
   listening: 'Listening…',
@@ -51,6 +52,8 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   // re-decoding or re-scheduling.
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
   const [listenPaused, setListenPaused] = useState(false);
+  const [backingVolume, setBackingVolume] = useBackingVolume();
+  const [replaying, setReplaying] = useState(false);
   // currentMs lives in a ref so frame-rate updates don't re-render the screen.
   // PitchRibbon reads it imperatively via rAF.
   const currentMsRef = useRef(0);
@@ -238,39 +241,59 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     });
     referenceRef.current = sound;
 
+    // Sync the playhead clock to the actual audio position via status
+    // callbacks. Earlier we used a free-running performance.now() clock
+    // that started when playAsync() resolved — but the audio backend
+    // takes a non-zero amount of time to actually start emitting (decode
+    // tail, output device latency), so the clock ran ahead of the audio
+    // and the pitch ribbon + lyric strip both led the playback by what
+    // could feel like a noticeable amount. Now we anchor to
+    // status.positionMillis on every callback (~33ms) and rAF-interpolate
+    // between callbacks for smooth cursor motion.
+    let lastStatusMs = 0;
+    let lastStatusTs = performance.now();
+    let paused = false;
     sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
       if (!status.isLoaded) return;
+      // Always trust the audio's reported position over the JS clock —
+      // re-anchor every time. While paused, positionMillis stays put and
+      // playback time should not advance.
+      lastStatusMs = status.positionMillis ?? 0;
+      lastStatusTs = performance.now();
       if (status.didJustFinish) {
         stopListenTicker();
         startCountdown();
       }
     });
+    // Bump the status update interval down so the anchor refreshes more
+    // often. Default is 500ms on some platforms, which lets the rAF
+    // interpolation drift visibly between callbacks.
+    sound.setProgressUpdateIntervalAsync?.(33).catch(() => {});
     await sound.playAsync();
 
-    // Drive currentMsRef at 60Hz for smooth cursor motion (expo-av's own
-    // status callbacks only fire at ~20Hz, which looks chunky). Tracking
-    // base + accumulated lets us pause without losing position.
-    let base = performance.now();
-    let accumulated = 0;
     listenClockRef.current = {
       pause() {
-        accumulated += performance.now() - base;
+        paused = true;
         if (listenRafRef.current !== null) cancelAnimationFrame(listenRafRef.current);
         listenRafRef.current = null;
       },
       resume() {
-        base = performance.now();
+        paused = false;
+        // Status callback will re-anchor on the next tick; in the
+        // meantime extrapolate from the last reported playhead.
+        lastStatusTs = performance.now();
         if (listenRafRef.current === null) {
           const tick = () => {
-            currentMsRef.current = accumulated + (performance.now() - base);
+            const elapsed = paused ? 0 : performance.now() - lastStatusTs;
+            currentMsRef.current = lastStatusMs + elapsed;
             listenRafRef.current = requestAnimationFrame(tick);
           };
           listenRafRef.current = requestAnimationFrame(tick);
         }
       },
       reset() {
-        base = performance.now();
-        accumulated = 0;
+        lastStatusMs = 0;
+        lastStatusTs = performance.now();
         currentMsRef.current = 0;
       },
     };
@@ -301,6 +324,30 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
     await referenceRef.current.playAsync().catch(() => {});
   }, [listenPaused]);
+
+  const replayTake = useCallback(async () => {
+    if (replaying) return;
+    setReplaying(true);
+    try {
+      let sound = playbackRef.current;
+      if (!sound) {
+        const uri = lastRecordingUriRef.current;
+        if (!uri) return;
+        const created = await Audio.Sound.createAsync({ uri });
+        sound = created.sound;
+        playbackRef.current = sound;
+      }
+      // replayAsync restarts from 0 even if the sound finished or is mid-play.
+      try {
+        await sound.replayAsync();
+      } catch {
+        await sound.setPositionAsync(0).catch(() => {});
+        await sound.playAsync().catch(() => {});
+      }
+    } finally {
+      setReplaying(false);
+    }
+  }, [replaying]);
 
   const restartRecording = useCallback(async () => {
     // Abort the in-progress take and re-enter count-in. We discard the
@@ -348,7 +395,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         bpm,
         beats: 4,
         backingUrl,
-        backingVolume: BACKING_VOLUME,
+        backingVolume,
         backingCacheKey: `${phrase.song_id}:${phrase.id}:backing`,
         vocalsUrl: phrase.vocals_url,
         vocalsEnabled: leadVocalEnabled,
@@ -377,7 +424,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase, leadVocalEnabled]);
+  }, [phrase, leadVocalEnabled, backingVolume]);
 
   // When the toggle flips mid-take, ramp the existing gain instead of
   // re-scheduling — no audible re-trigger and no buffer re-decode.
@@ -465,6 +512,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
           <>
             <RetroButton label="Listen" icon="play" onPress={playReference} size="lg" />
             <Text style={styles.hint}>🎧 headphones recommended</Text>
+            <BackingVolumeControl
+              value={backingVolume}
+              onChange={setBackingVolume}
+            />
           </>
         )}
         {stage === 'listening' && (
@@ -479,12 +530,18 @@ export default function SessionScreen({ phrase, onBack }: Props) {
           </View>
         )}
         {stage === 'countdown' && (
-          <Text style={styles.countdown}>{countdown || ' '}</Text>
+          <View style={styles.countdownRow}>
+            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
+            <Text style={styles.countdown}>{countdown || ' '}</Text>
+          </View>
         )}
         {stage === 'recording' && (
-          <View style={styles.controlRow}>
-            <RetroButton label="Restart" onPress={restartRecording} size="md" />
-            <RetroButton label="Stop" onPress={stopRecording} variant="danger" size="md" />
+          <View style={styles.recordingControls}>
+            <BeatBall bpm={phrase.tempo_bpm ?? 120} active />
+            <View style={styles.controlRow}>
+              <RetroButton label="Restart" onPress={restartRecording} size="md" />
+              <RetroButton label="Stop" onPress={stopRecording} variant="danger" size="md" />
+            </View>
           </View>
         )}
         {stage === 'done' && (
@@ -494,6 +551,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             feedback={feedback}
             feedbackPending={feedbackPending}
             onAgain={reset}
+            onReplay={replayTake}
           />
         )}
         {stage === 'error' && (
@@ -551,12 +609,14 @@ function DoneView({
   feedback,
   feedbackPending,
   onAgain,
+  onReplay,
 }: {
   analysis: PitchAnalysis | null;
   analysisPending: boolean;
   feedback: FeedbackResult | null;
   feedbackPending: boolean;
   onAgain: () => void;
+  onReplay: () => void;
 }) {
   const pct = analysis ? Math.round(analysis.hit_rate * 100) : null;
   const cents = analysis ? Math.round(analysis.avg_abs_cents_off) : null;
@@ -597,7 +657,49 @@ function DoneView({
       ) : feedbackPending ? (
         <Text style={styles.feedbackPending}>COACH IS LISTENING…</Text>
       ) : null}
-      <RetroButton label="Again" onPress={onAgain} size="lg" />
+      <View style={styles.controlRow}>
+        <RetroButton label="Replay" icon="play" onPress={onReplay} size="md" />
+        <RetroButton label="Again" onPress={onAgain} size="md" />
+      </View>
+    </View>
+  );
+}
+
+function BackingVolumeControl({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const pct = Math.round(value * 100);
+  return (
+    <View style={styles.volumeRow}>
+      <Text style={styles.volumeLabel}>BACKING</Text>
+      <Pressable
+        onPress={() => onChange(nextStep(value, -1))}
+        style={({ pressed }) => [
+          styles.volumeBtn,
+          pressed && styles.volumeBtnPressed,
+        ]}
+        hitSlop={8}
+      >
+        <Text style={styles.volumeBtnLabel}>−</Text>
+      </Pressable>
+      <View style={styles.volumeBar}>
+        <View style={[styles.volumeFill, { width: `${pct}%` }]} />
+      </View>
+      <Pressable
+        onPress={() => onChange(nextStep(value, +1))}
+        style={({ pressed }) => [
+          styles.volumeBtn,
+          pressed && styles.volumeBtnPressed,
+        ]}
+        hitSlop={8}
+      >
+        <Text style={styles.volumeBtnLabel}>+</Text>
+      </Pressable>
+      <Text style={styles.volumePct}>{pct}%</Text>
     </View>
   );
 }
@@ -740,8 +842,65 @@ const styles = StyleSheet.create({
     lineHeight: 96,
     color: COLORS.black,
   },
+  countdownRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 18,
+  },
+  recordingControls: {
+    alignItems: 'center',
+    gap: 8,
+  },
   hint: { fontFamily: FONTS.monaco, fontSize: 12 },
   controlRow: { flexDirection: 'row', gap: 12, alignItems: 'center' },
+  volumeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 4,
+  },
+  volumeLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 10,
+    letterSpacing: 1,
+    color: COLORS.black,
+  },
+  volumeBtn: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  volumeBtnPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  volumeBtnLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 14,
+    color: COLORS.black,
+    lineHeight: 14,
+  },
+  volumeBar: {
+    width: 80,
+    height: 8,
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+  },
+  volumeFill: {
+    height: '100%',
+    backgroundColor: COLORS.black,
+  },
+  volumePct: {
+    fontFamily: FONTS.monaco,
+    fontSize: 10,
+    width: 32,
+    color: COLORS.black,
+  },
   doneWrap: { alignItems: 'center', gap: 10, maxWidth: 420, width: '100%' },
   savedLabel: {
     fontFamily: FONTS.chicago,

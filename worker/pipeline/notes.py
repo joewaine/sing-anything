@@ -43,6 +43,24 @@ def quantize_notes(pitch: dict, words: list[dict], min_confidence: float = 0.5) 
     confs = pitch["confidences"]
 
     notes: list[dict] = []
+    # Track the most-recent emitted note's pitch so we can fall back to it
+    # when a word's pitch window is too short or too unconfident to trust.
+    # Without this, any word that lyrics_verify inserted via LRCLIB merge
+    # would silently disappear if its synthesized [start,end] happened to
+    # land on an instrumental gap. With it, the lyric reliably surfaces in
+    # the strip even when the underlying pitch is murky.
+    last_pitch: int | None = None
+
+    def _emit_stub(word: dict) -> None:
+        if last_pitch is None:
+            return
+        notes.append({
+            "start_ms": int(round(word["start"] * 1000)),
+            "end_ms": int(round(word["end"] * 1000)),
+            "pitch_midi": last_pitch,
+            "lyric": word.get("word", ""),
+        })
+
     for w in words:
         start_s, end_s = w["start"], w["end"]
         if end_s - start_s < 0.04:
@@ -51,6 +69,7 @@ def quantize_notes(pitch: dict, words: list[dict], min_confidence: float = 0.5) 
         i0 = int(np.searchsorted(times, start_s, side="left"))
         i1 = int(np.searchsorted(times, end_s, side="left"))
         if i1 - i0 < MIN_FRAMES_PER_NOTE:
+            _emit_stub(w)
             continue
 
         m_slice = midis[i0:i1]
@@ -58,6 +77,7 @@ def quantize_notes(pitch: dict, words: list[dict], min_confidence: float = 0.5) 
         t_slice = times[i0:i1]
         good = (c_slice > min_confidence) & np.isfinite(m_slice)
         if good.sum() < MIN_FRAMES_PER_NOTE:
+            _emit_stub(w)
             continue
 
         # Walk the word's frames; whenever the running median deviates by
@@ -100,6 +120,7 @@ def quantize_notes(pitch: dict, words: list[dict], min_confidence: float = 0.5) 
         _flush()
 
         if not sub_notes:
+            _emit_stub(w)
             continue
 
         # Merge any sub-notes shorter than MIN_NOTE_MS into a neighbor.
@@ -134,5 +155,6 @@ def quantize_notes(pitch: dict, words: list[dict], min_confidence: float = 0.5) 
                 # melisma splits.
                 "lyric": w["word"] if idx == 0 else "",
             })
+            last_pitch = sm
 
     return notes

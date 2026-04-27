@@ -128,15 +128,38 @@ def prefetch_lrclib(song_name: str | None, artist: str | None) -> None:
         print(f"[lyrics_verify] prefetch error: {e}")
 
 
+def _interp_word(prev_end: float, next_start: float, k: int, total: int, base: dict) -> dict:
+    """Build a synthetic word dict between two whisper words by linear
+    interpolation. The base dict carries the original whisper word's score
+    so we don't claim higher confidence than we have.
+    """
+    span = max(0.0, next_start - prev_end)
+    # Slot k of total inside [prev_end, next_start]
+    s = prev_end + span * (k / max(1, total))
+    e = prev_end + span * ((k + 1) / max(1, total))
+    return {
+        "start": float(s),
+        "end": float(e),
+        "word": "",  # filled in by caller
+        "score": float(base.get("score", 0.0)) * 0.5,  # synthetic — half score
+    }
+
+
 def _align_canonical(
     words: list[dict],
     canonical_text: str,
 ) -> tuple[Optional[list[dict]], float]:
     """Align canonical lyric tokens to whisper's word sequence.
 
-    Returns (corrected_words | None, ratio). The ratio is exposed so the
-    caller can skip the Claude fallback when LRCLIB is already
-    high-confidence (cuts a 2–4s LLM round trip).
+    Returns (corrected_words | None, ratio). When LRCLIB has words whisper
+    missed entirely (insert / longer replace runs), they are emitted with
+    interpolated timestamps so the lyric strip and piano roll show the
+    full line — even if the underlying audio frames don't have a clean
+    pitch sample for them. notes.py's MIN_FRAMES_PER_NOTE guard keeps any
+    noisy synthetic notes from polluting the roll; the lyric still shows.
+
+    The ratio is exposed so the caller can skip the Claude fallback when
+    LRCLIB is already high-confidence.
     """
     whisper_norms = [_tokenize(w["word"]) for w in words]
     whisper_tokens = [(toks[0] if toks else "") for toks in whisper_norms]
@@ -148,33 +171,77 @@ def _align_canonical(
 
     matcher = difflib.SequenceMatcher(None, whisper_tokens, canon_tokens)
     ratio = matcher.ratio()
-    print(f"[lyrics_verify] lrclib ratio={ratio:.2f} whisper={len(whisper_tokens)} canon={len(canon_tokens)}")
+    print(
+        f"[lyrics_verify] lrclib ratio={ratio:.2f} whisper={len(whisper_tokens)} "
+        f"canon={len(canon_tokens)}"
+    )
     if ratio < LRCLIB_MIN_RATIO:
         return None, ratio
 
-    corrected = [dict(w) for w in words]
+    out: list[dict] = []
+    inserted = 0
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        canon_run = canon_pairs[j1:j2]
+        whisp_run = words[i1:i2]
         if tag == "equal":
-            # Whisper had it right, but capitalize / punctuate from canonical.
-            for k in range(i2 - i1):
-                if j1 + k < len(canon_pairs):
-                    corrected[i1 + k]["word"] = canon_pairs[j1 + k][1]
+            # Whisper had it right; capitalize / punctuate from canonical.
+            for k, w in enumerate(whisp_run):
+                copy = dict(w)
+                if k < len(canon_run):
+                    copy["word"] = canon_run[k][1]
+                out.append(copy)
         elif tag == "replace":
-            # Whisper had wrong words; use canonical text for as many slots
-            # as whisper occupied (stretch or compress to fit).
-            canon_run = canon_pairs[j1:j2]
-            whisp_slots = i2 - i1
-            for k in range(whisp_slots):
-                # Map whisper position k to canonical position
-                idx = int(round(k * (len(canon_run) - 1) / max(1, whisp_slots - 1)))
-                idx = max(0, min(idx, len(canon_run) - 1)) if canon_run else -1
-                if idx >= 0:
-                    corrected[i1 + k]["word"] = canon_run[idx][1]
-        # For 'insert' (canon has extra words) and 'delete' (whisper had extra),
-        # we leave whisper's original text. Mismatch is usually background
-        # vocals / repeated choruses — safer to keep whisper than invent words.
+            if len(canon_run) <= len(whisp_run):
+                # Same or fewer canonical words — stretch to fit whisper slots.
+                for k in range(len(whisp_run)):
+                    copy = dict(whisp_run[k])
+                    if canon_run:
+                        idx = int(round(k * (len(canon_run) - 1) / max(1, len(whisp_run) - 1)))
+                        idx = max(0, min(idx, len(canon_run) - 1))
+                        copy["word"] = canon_run[idx][1]
+                    out.append(copy)
+            else:
+                # Canonical has MORE words than whisper detected — distribute
+                # across whisper's time span so missed words reappear.
+                span_start = float(whisp_run[0]["start"])
+                span_end = float(whisp_run[-1]["end"])
+                span = max(0.0, span_end - span_start)
+                for k, (_, original) in enumerate(canon_run):
+                    s = span_start + span * (k / max(1, len(canon_run)))
+                    e = span_start + span * ((k + 1) / max(1, len(canon_run)))
+                    score_base = whisp_run[min(k, len(whisp_run) - 1)].get("score", 0.0)
+                    out.append({
+                        "start": float(s),
+                        "end": float(e),
+                        "word": original,
+                        "score": float(score_base) * 0.7,  # mix of whisper conf and our guess
+                    })
+                    inserted += max(0, 1 if k >= len(whisp_run) else 0)
+        elif tag == "insert":
+            # Canonical has words whisper missed entirely. Place them in the
+            # time gap between whisper's previous and next word.
+            prev_end = float(out[-1]["end"]) if out else 0.0
+            # Look ahead: next anchor is whisper word at i1 (which is the
+            # first word of the next opcode's whisper range).
+            next_start = (
+                float(words[i1]["start"]) if i1 < len(words) else (prev_end + 1.0)
+            )
+            for k, (_, original) in enumerate(canon_run):
+                slot = _interp_word(prev_end, next_start, k, len(canon_run),
+                                    whisp_run[0] if whisp_run else (out[-1] if out else {}))
+                slot["word"] = original
+                out.append(slot)
+                inserted += 1
+        elif tag == "delete":
+            # Whisper had words canon doesn't (chorus repeats, ad-libs). Keep
+            # whisper's text — these are real audible sounds we shouldn't drop.
+            for w in whisp_run:
+                out.append(dict(w))
 
-    return corrected, ratio
+    if inserted:
+        print(f"[lyrics_verify] inserted {inserted} canonical words missed by whisper")
+
+    return out, ratio
 
 
 def _claude_fetch(words: list[dict], song_name: str, artist: str | None) -> Optional[list[dict]]:
