@@ -15,7 +15,53 @@ import { startCountIn, type CountInHandle } from '../lib/countInClicks';
 import { getAudioContext } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
 import { useBackingVolume, nextStep } from '../lib/backingVolume';
+import {
+  useSyncOffset,
+  SYNC_OFFSET_STEP_MS,
+  SYNC_OFFSET_MIN_MS,
+  SYNC_OFFSET_MAX_MS,
+} from '../lib/syncOffset';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
+
+/**
+ * Build the aligned (loop-length, head-shifted) recording buffer.
+ * `extraOffsetMs` is the user-adjustable sync nudge — layered on top
+ * of the auto-detected output latency to cope with Bluetooth headphone
+ * latency the browser may under-report. Pulled into a file-level
+ * helper so the syncOffset effect can rebuild without re-fetching
+ * the recording or duplicating the math from takePlayback.ts.
+ */
+function buildAlignedRecording(
+  ctx: AudioContext,
+  raw: AudioBuffer,
+  loopDurationSec: number,
+  extraOffsetMs: number,
+): AudioBuffer {
+  const targetLength = Math.max(
+    1,
+    Math.round(loopDurationSec * raw.sampleRate),
+  );
+  const autoHeadOffsetSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
+  const totalOffsetSec = Math.max(0, autoHeadOffsetSec + extraOffsetMs / 1000);
+  const headOffsetSamples = Math.max(
+    0,
+    Math.round(totalOffsetSec * raw.sampleRate),
+  );
+  const aligned = ctx.createBuffer(
+    raw.numberOfChannels,
+    targetLength,
+    raw.sampleRate,
+  );
+  for (let ch = 0; ch < raw.numberOfChannels; ch++) {
+    const src = raw.getChannelData(ch);
+    const dst = aligned.getChannelData(ch);
+    const copyLen = Math.min(src.length, targetLength - headOffsetSamples);
+    if (copyLen > 0) {
+      dst.set(src.subarray(0, copyLen), headOffsetSamples);
+    }
+  }
+  return aligned;
+}
 
 // Stages:
 //   loading — phrase audio buffers warming, screen first mounts
@@ -50,6 +96,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const [leadVocalEnabled, setLeadVocalEnabled] = useState(true);
   const [backingEnabled, setBackingEnabled] = useState(true);
   const [backingVolume, setBackingVolume] = useBackingVolume();
+  const [syncOffsetMs, setSyncOffsetMs] = useSyncOffset();
   // Toggle for the user's own recorded take during done-view playback.
   // Default on — the whole point of done view is hearing yourself.
   const [yourTakeEnabled, setYourTakeEnabled] = useState(true);
@@ -65,6 +112,9 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   // with the Web Audio backing.
   const recordingSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const recordingGainRef = useRef<GainNode | null>(null);
+  // Raw decoded recording (kept around so a syncOffset nudge can rebuild
+  // the aligned buffer without re-fetching/decoding).
+  const recordingRawBufferRef = useRef<AudioBuffer | null>(null);
   const lastRecordingUriRef = useRef<string | null>(null);
   const countInRef = useRef<CountInHandle | null>(null);
   // Set true the moment the screen unmounts. Async paths that create
@@ -134,6 +184,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     backingVolume,
     leadVocalEnabled,
     yourTakeEnabled,
+    syncOffsetMs,
   });
   useEffect(() => {
     settingsRef.current = {
@@ -141,8 +192,15 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       backingVolume,
       leadVocalEnabled,
       yourTakeEnabled,
+      syncOffsetMs,
     };
-  }, [backingEnabled, backingVolume, leadVocalEnabled, yourTakeEnabled]);
+  }, [
+    backingEnabled,
+    backingVolume,
+    leadVocalEnabled,
+    yourTakeEnabled,
+    syncOffsetMs,
+  ]);
 
   const startLoopFromZero = useCallback(async () => {
     phraseLoopRef.current?.stop();
@@ -250,6 +308,43 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     gain.gain.linearRampToValueAtTime(yourTakeEnabled ? 1.0 : 0, t + 0.03);
   }, [yourTakeEnabled]);
 
+  // Sync nudge: rebuild the aligned recording buffer with the new
+  // offset and restart the take source at the current loop position.
+  // Backing keeps playing — only the take is re-anchored. No-op if
+  // we're not currently in done view (no source/buffer yet).
+  useEffect(() => {
+    const ctx = getAudioContext();
+    const raw = recordingRawBufferRef.current;
+    const phraseLoop = phraseLoopRef.current;
+    const oldSrc = recordingSourceRef.current;
+    const gain = recordingGainRef.current;
+    if (!ctx || !raw || !phraseLoop || !gain) return;
+    const aligned = buildAlignedRecording(
+      ctx,
+      raw,
+      phrase.duration_ms / 1000,
+      syncOffsetMs,
+    );
+    const positionMs = phraseLoop.getPositionMs();
+    const positionSec = Math.max(
+      0,
+      Math.min(phrase.duration_ms / 1000, positionMs / 1000),
+    );
+    if (oldSrc) {
+      try {
+        oldSrc.stop();
+      } catch {
+        // already stopped
+      }
+    }
+    const s = ctx.createBufferSource();
+    s.buffer = aligned;
+    s.loop = true;
+    s.connect(gain);
+    s.start(ctx.currentTime + 0.02, positionSec);
+    recordingSourceRef.current = s;
+  }, [syncOffsetMs, phrase.duration_ms]);
+
   // Start (or restart) playback of the just-recorded take alongside a
   // looping phrase backing track. On web both sources are scheduled at
   // the SAME ctx.currentTime so they're sample-accurately aligned —
@@ -318,36 +413,16 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
 
     if (ctx && recordingBuffer) {
-      // Web Audio path: schedule the recording at the same ctx time
-      // as the phrase loop. Pad/trim to phrase duration AND shift
-      // content right by the recording-time latency gap (mic-on
-      // instant precedes audible-backing by ~0.05+outputLatency).
-      // Without the shift the user's voice plays ~150ms ahead of
-      // the music it was responding to. See takePlayback.ts for
-      // the same compensation in the takes view.
+      // Stash raw buffer so the syncOffset nudge can rebuild without
+      // re-fetching the recording.
+      recordingRawBufferRef.current = recordingBuffer;
       const phraseSec = phrase.duration_ms / 1000;
-      const targetLength = Math.max(
-        1,
-        Math.round(phraseSec * recordingBuffer.sampleRate),
+      const aligned = buildAlignedRecording(
+        ctx,
+        recordingBuffer,
+        phraseSec,
+        settingsRef.current.syncOffsetMs,
       );
-      const headOffsetSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
-      const headOffsetSamples = Math.max(
-        0,
-        Math.round(headOffsetSec * recordingBuffer.sampleRate),
-      );
-      const aligned = ctx.createBuffer(
-        recordingBuffer.numberOfChannels,
-        targetLength,
-        recordingBuffer.sampleRate,
-      );
-      for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
-        const src = recordingBuffer.getChannelData(ch);
-        const dst = aligned.getChannelData(ch);
-        const copyLen = Math.min(src.length, targetLength - headOffsetSamples);
-        if (copyLen > 0) {
-          dst.set(src.subarray(0, copyLen), headOffsetSamples);
-        }
-      }
       const source = ctx.createBufferSource();
       source.buffer = aligned;
       source.loop = true;
@@ -619,6 +694,8 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             onToggleYourTake={() => setYourTakeEnabled((v) => !v)}
             backingVolume={backingVolume}
             onChangeBackingVolume={setBackingVolume}
+            syncOffsetMs={syncOffsetMs}
+            onChangeSyncOffset={setSyncOffsetMs}
           />
         )}
         {stage === 'error' && (
@@ -707,6 +784,8 @@ function DoneView({
   onToggleYourTake,
   backingVolume,
   onChangeBackingVolume,
+  syncOffsetMs,
+  onChangeSyncOffset,
 }: {
   analysis: PitchAnalysis | null;
   analysisPending: boolean;
@@ -722,6 +801,8 @@ function DoneView({
   onToggleYourTake: () => void;
   backingVolume: number;
   onChangeBackingVolume: (v: number) => void;
+  syncOffsetMs: number;
+  onChangeSyncOffset: (ms: number) => void;
 }) {
   const pct = analysis ? Math.round(analysis.hit_rate * 100) : null;
   const cents = analysis ? Math.round(analysis.avg_abs_cents_off) : null;
@@ -783,10 +864,54 @@ function DoneView({
         value={backingVolume}
         onChange={onChangeBackingVolume}
       />
+      <SyncNudge value={syncOffsetMs} onChange={onChangeSyncOffset} />
       <View style={styles.controlRow}>
         <RetroButton label="Replay" icon="play" onPress={onReplay} size="md" />
         <RetroButton label="Again" onPress={onAgain} size="md" />
       </View>
+    </View>
+  );
+}
+
+function SyncNudge({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (ms: number) => void;
+}) {
+  const sign = value > 0 ? '+' : '';
+  return (
+    <View style={styles.volumeRow}>
+      <Text style={styles.volumeLabel}>SYNC</Text>
+      <Pressable
+        onPress={() =>
+          onChange(Math.max(SYNC_OFFSET_MIN_MS, value - SYNC_OFFSET_STEP_MS))
+        }
+        style={({ pressed }) => [
+          styles.volumeBtn,
+          pressed && styles.volumeBtnPressed,
+        ]}
+        hitSlop={8}
+      >
+        <Text style={styles.volumeBtnLabel}>−</Text>
+      </Pressable>
+      <Text style={styles.volumePct}>
+        {sign}
+        {value}ms
+      </Text>
+      <Pressable
+        onPress={() =>
+          onChange(Math.min(SYNC_OFFSET_MAX_MS, value + SYNC_OFFSET_STEP_MS))
+        }
+        style={({ pressed }) => [
+          styles.volumeBtn,
+          pressed && styles.volumeBtnPressed,
+        ]}
+        hitSlop={8}
+      >
+        <Text style={styles.volumeBtnLabel}>+</Text>
+      </Pressable>
     </View>
   );
 }

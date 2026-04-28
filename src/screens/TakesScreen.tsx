@@ -12,6 +12,12 @@ import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
 import { listAttempts, signTakeUrls, type TakeRow } from '../lib/attempts';
 import { startTakePlayback, type TakePlaybackHandle } from '../lib/takePlayback';
+import {
+  useSyncOffset,
+  SYNC_OFFSET_STEP_MS,
+  SYNC_OFFSET_MIN_MS,
+  SYNC_OFFSET_MAX_MS,
+} from '../lib/syncOffset';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 type Props = {
@@ -26,6 +32,12 @@ export default function TakesScreen({ onBack }: Props) {
     null,
   );
   const handleRef = useRef<TakePlaybackHandle | null>(null);
+  const [syncOffset, setSyncOffset] = useSyncOffset();
+
+  // Apply latest sync nudge to the active handle without restarting.
+  useEffect(() => {
+    activeHandle?.setExtraOffsetMs(syncOffset);
+  }, [syncOffset, activeHandle]);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +78,7 @@ export default function TakesScreen({ onBack }: Props) {
           loopDurationSec: take.phrase.duration_ms / 1000,
           songId: take.phrase.song_id,
           phraseId: take.phrase.id,
+          extraOffsetMs: syncOffset,
         });
         if (!handle) {
           setError('Audio not available on this device');
@@ -115,6 +128,8 @@ export default function TakesScreen({ onBack }: Props) {
                 handle={item.id === activeId ? activeHandle : null}
                 onPlay={() => playTake(item)}
                 onStop={stopActive}
+                syncOffset={syncOffset}
+                onChangeSyncOffset={setSyncOffset}
               />
             )}
           />
@@ -130,12 +145,16 @@ function TakeRowView({
   handle,
   onPlay,
   onStop,
+  syncOffset,
+  onChangeSyncOffset,
 }: {
   take: TakeRow;
   isActive: boolean;
   handle: TakePlaybackHandle | null;
   onPlay: () => void;
   onStop: () => void;
+  syncOffset: number;
+  onChangeSyncOffset: (ms: number) => void;
 }) {
   // Toggle states are local to a row that's actively playing — they
   // stay in sync with the live handle's gains via the setter calls.
@@ -249,8 +268,47 @@ function TakeRowView({
               onToggle={() => setTake((v) => !v)}
             />
           </View>
+          <SyncNudge value={syncOffset} onChange={onChangeSyncOffset} />
         </>
       )}
+    </View>
+  );
+}
+
+function SyncNudge({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (ms: number) => void;
+}) {
+  const sign = value > 0 ? '+' : '';
+  return (
+    <View style={styles.syncRow}>
+      <Text style={styles.syncLabel}>SYNC</Text>
+      <Pressable
+        onPress={() =>
+          onChange(Math.max(SYNC_OFFSET_MIN_MS, value - SYNC_OFFSET_STEP_MS))
+        }
+        style={({ pressed }) => [styles.syncBtn, pressed && styles.syncBtnPressed]}
+        hitSlop={6}
+      >
+        <Text style={styles.syncBtnLabel}>−</Text>
+      </Pressable>
+      <Text style={styles.syncValue}>
+        {sign}
+        {value} ms
+      </Text>
+      <Pressable
+        onPress={() =>
+          onChange(Math.min(SYNC_OFFSET_MAX_MS, value + SYNC_OFFSET_STEP_MS))
+        }
+        style={({ pressed }) => [styles.syncBtn, pressed && styles.syncBtnPressed]}
+        hitSlop={6}
+      >
+        <Text style={styles.syncBtnLabel}>+</Text>
+      </Pressable>
+      <Text style={styles.syncHint}>+ if your voice sounds early</Text>
     </View>
   );
 }
@@ -422,6 +480,51 @@ const styles = StyleSheet.create({
     color: COLORS.black,
     minWidth: 36,
     textAlign: 'center',
+  },
+  syncRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 4,
+  },
+  syncLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 10,
+    letterSpacing: 1,
+    color: COLORS.black,
+  },
+  syncBtn: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  syncBtnPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  syncBtnLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 14,
+    color: COLORS.black,
+    lineHeight: 14,
+  },
+  syncValue: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    minWidth: 56,
+    textAlign: 'center',
+    color: COLORS.black,
+  },
+  syncHint: {
+    fontFamily: FONTS.monaco,
+    fontSize: 10,
+    color: COLORS.softGrey,
+    flex: 1,
   },
   chip: {
     paddingHorizontal: 10,
