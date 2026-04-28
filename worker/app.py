@@ -116,6 +116,21 @@ class YoutubeBlockedError(RuntimeError):
     Carries a user-friendly message for the songs.error column."""
 
 
+def _rotate_proxy_session(proxy_url: str) -> str:
+    """Replace any `session-XXX` modifier in the proxy URL's userinfo
+    with a fresh random token. IPRoyal embeds session pinning in the
+    password as `..._session-AAAAAAAA_lifetime-30m`; swapping the token
+    per call gets us a different residential exit IP for every YouTube
+    fetch without giving up country pinning. If the URL has no session
+    modifier, returns it unchanged."""
+    import re
+    import secrets as _secrets
+    fresh = _secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
+    if not fresh:  # tiny guard against the rare empty replacement
+        fresh = "rot" + str(int(_secrets.randbelow(10**8)))
+    return re.sub(r"session-[A-Za-z0-9]+", f"session-{fresh}", proxy_url)
+
+
 def _yt_download(url: str, dest: Path) -> dict:
     """Extract the best audio-only stream via yt-dlp and save as mp3.
 
@@ -162,6 +177,16 @@ def _yt_download(url: str, dest: Path) -> dict:
     if is_youtube:
         proxy_url = os.environ.get("PROXY_URL")
         if proxy_url:
+            # Rotate the session token per call so each YouTube fetch
+            # routes via a different residential exit IP. The IPRoyal
+            # password format embeds modifiers like
+            #   country-us_session-XXXX_lifetime-30m
+            # session-XXXX tells IPRoyal "pin the same IP for this
+            # token's lifetime". Without rotation a single flagged IP
+            # blocks every YouTube call for 30 minutes; rotating the
+            # token per call defeats per-IP bot flags from Google
+            # without giving up the country pinning.
+            proxy_url = _rotate_proxy_session(proxy_url)
             opts["proxy"] = proxy_url
             # Be patient with transient fragment errors — residential
             # exits sometimes drop a packet mid-stream, and YouTube's
@@ -170,7 +195,8 @@ def _yt_download(url: str, dest: Path) -> dict:
             opts["retries"] = 8
             opts["fragment_retries"] = 8
             opts["socket_timeout"] = 30
-            print(f"[_yt_download] routing YouTube via residential proxy")
+            print("[_yt_download] routing YouTube via residential proxy "
+                  "(session rotated)")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
