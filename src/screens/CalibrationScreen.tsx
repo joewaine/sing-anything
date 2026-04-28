@@ -1,12 +1,16 @@
-// One-time tap-along audio sync calibration.
+// Open-ended tap-along audio sync calibration.
 //
-// Plays 6 metronome clicks; the user taps a big button on each one. We
-// compare each tap's performance.now() to the click's predicted audible
-// performance.now() (scheduled time mapped through ctx.getOutputTimestamp,
-// plus ctx.outputLatency) and average the residuals. The residual is
-// what ctx.outputLatency under-reports — typically near zero on wired,
-// 100–300ms on Bluetooth headphones. Saved to syncOffsetMs so playback
-// in done view + takes view applies the corrected offset automatically.
+// Plays a steady metronome and waits for the user to tap along. We
+// match each tap to the nearest scheduled beat (within VALID_WINDOW)
+// and average the resulting offsets. As soon as we have enough good
+// taps the run finalizes automatically. No time limit — keep tapping
+// at your own pace; the click loop runs until you've supplied enough
+// matches or hit "Stop".
+//
+// The mean residual is what ctx.outputLatency under-reports — typically
+// near zero on wired, 100–300ms on Bluetooth headphones. Saved to
+// syncOffsetMs so playback in done view + takes view applies the
+// corrected offset automatically.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
@@ -21,29 +25,45 @@ type Props = {
 };
 
 const BPM = 100;
-const N_BEATS = 6;
-// First beat is "cold" — reaction time dominates because the user hasn't
-// settled into the rhythm yet. Drop it from the average.
-const DROP_FIRST = 1;
+const TARGET_GOOD_TAPS = 5;
+// A tap is "good" if its distance to the nearest beat is under this.
+// 400ms ≈ ±0.4 of a beat at 100 BPM — generous enough that a user
+// who's a half-beat off still gets credit, tight enough that random
+// taps don't pollute the average.
+const VALID_WINDOW_MS = 400;
+// Drop the first matched tap from the average — cold reaction time
+// dominates before the user settles into the rhythm.
+const DROP_FIRST_GOOD = 1;
+// Schedule beats in chunks; refill as the running schedule gets short.
+const CHUNK_SIZE = 16;
 
-type Phase = 'intro' | 'leadin' | 'running' | 'result';
+type Phase = 'intro' | 'running' | 'result';
+
+type Beat = {
+  ctxTime: number;
+  audiblePerf: number;
+};
 
 export default function CalibrationScreen({ onBack }: Props) {
   const [phase, setPhase] = useState<Phase>('intro');
-  const [beatIdx, setBeatIdx] = useState(0);
+  const [goodCount, setGoodCount] = useState(0);
   const [residualMs, setResidualMs] = useState<number | null>(null);
   const [, setSyncOffset] = useSyncOffset();
 
-  // Per-run state stashed in refs so the rAF/setTimeout chain doesn't
-  // close over stale state.
-  const expectedPerfTimesRef = useRef<number[]>([]);
-  const tapPerfTimesRef = useRef<number[]>([]);
+  const beatsRef = useRef<Beat[]>([]);
+  const matchedRef = useRef<Set<number>>(new Set());
+  const offsetsRef = useRef<number[]>([]);
   const oscillatorsRef = useRef<OscillatorNode[]>([]);
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const refillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stoppedRef = useRef(false);
 
   const teardown = useCallback(() => {
+    stoppedRef.current = true;
     timersRef.current.forEach(clearTimeout);
     timersRef.current = [];
+    if (refillTimerRef.current) clearTimeout(refillTimerRef.current);
+    refillTimerRef.current = null;
     oscillatorsRef.current.forEach((o) => {
       try {
         o.stop();
@@ -56,35 +76,49 @@ export default function CalibrationScreen({ onBack }: Props) {
 
   useEffect(() => () => teardown(), [teardown]);
 
-  const start = useCallback(() => {
-    const ctx = getAudioContext();
-    if (!ctx) return;
+  const finalize = useCallback(() => {
     teardown();
-    expectedPerfTimesRef.current = [];
-    tapPerfTimesRef.current = [];
-    setBeatIdx(0);
-    setResidualMs(null);
-    setPhase('leadin');
+    const offsets = offsetsRef.current;
+    const usable = offsets.slice(DROP_FIRST_GOOD);
+    if (usable.length === 0) {
+      setResidualMs(null);
+      setPhase('result');
+      return;
+    }
+    const avg = usable.reduce((a, b) => a + b, 0) / usable.length;
+    setResidualMs(Math.round(avg));
+    setPhase('result');
+  }, [teardown]);
 
+  // Schedule N more beats starting from the next slot. Called once on
+  // start and again whenever we're getting close to running out.
+  const scheduleChunk = useCallback((n: number) => {
+    const ctx = getAudioContext();
+    if (!ctx || stoppedRef.current) return;
     const beatSec = 60 / BPM;
-    const startAt = ctx.currentTime + 0.8;
+
+    // First beat is either right after startAt (initial chunk) or
+    // immediately after the last scheduled beat (refill).
+    const last = beatsRef.current[beatsRef.current.length - 1];
+    const firstCtxTime =
+      last !== undefined ? last.ctxTime + beatSec : ctx.currentTime + 0.8;
+
     const ts = ctx.getOutputTimestamp();
-    // perf time = ctxSec * 1000 + perfAtCtxZero
     const perfAtCtxZero =
       (ts.performanceTime ?? performance.now()) - (ts.contextTime ?? 0) * 1000;
     const outputLatencyMs =
       (typeof ctx.outputLatency === 'number' ? ctx.outputLatency : 0) * 1000;
 
-    for (let i = 0; i < N_BEATS; i++) {
-      const ctxTime = startAt + i * beatSec;
+    for (let i = 0; i < n; i++) {
+      const ctxTime = firstCtxTime + i * beatSec;
       const audiblePerf = ctxTime * 1000 + perfAtCtxZero + outputLatencyMs;
-      expectedPerfTimesRef.current.push(audiblePerf);
+      beatsRef.current.push({ ctxTime, audiblePerf });
 
-      // Schedule click — same shape as countInClicks.
+      // Click: same square-osc shape as countInClicks.
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'square';
-      osc.frequency.value = i === 0 ? 1200 : 800;
+      osc.frequency.value = i % 4 === 0 ? 1200 : 800;
       gain.gain.setValueAtTime(0, ctxTime);
       gain.gain.linearRampToValueAtTime(0.18, ctxTime + 0.002);
       gain.gain.exponentialRampToValueAtTime(0.0001, ctxTime + 0.06);
@@ -92,58 +126,68 @@ export default function CalibrationScreen({ onBack }: Props) {
       osc.start(ctxTime);
       osc.stop(ctxTime + 0.07);
       oscillatorsRef.current.push(osc);
-
-      // UI: advance counter when each beat fires.
-      const delayToBeatMs = Math.max(0, audiblePerf - performance.now());
-      timersRef.current.push(
-        setTimeout(() => {
-          setBeatIdx(i + 1);
-          if (i === 0) setPhase('running');
-        }, delayToBeatMs),
-      );
     }
 
-    // After all beats + grace, flip to result. If the user missed a tap
-    // we still finalize so they can retry.
+    // Schedule a refill when we're 3 beats away from running out.
     const lastBeatPerf =
-      expectedPerfTimesRef.current[expectedPerfTimesRef.current.length - 1];
-    const finalizeDelay = Math.max(
-      0,
-      lastBeatPerf - performance.now() + 800,
-    );
-    timersRef.current.push(setTimeout(finalize, finalizeDelay));
-  }, [teardown]);
-
-  const finalize = useCallback(() => {
-    const taps = tapPerfTimesRef.current;
-    const expected = expectedPerfTimesRef.current;
-    if (taps.length < N_BEATS - DROP_FIRST) {
-      // Not enough taps — show error-ish result with retry.
-      setResidualMs(null);
-      setPhase('result');
-      return;
-    }
-    const offsets: number[] = [];
-    // Pair each tap to its expected beat by index. If user double-taps
-    // or misses, we skip the corresponding pair.
-    const N = Math.min(taps.length, expected.length);
-    for (let i = DROP_FIRST; i < N; i++) {
-      offsets.push(taps[i] - expected[i]);
-    }
-    if (offsets.length === 0) {
-      setResidualMs(null);
-      setPhase('result');
-      return;
-    }
-    const avg = offsets.reduce((a, b) => a + b, 0) / offsets.length;
-    setResidualMs(Math.round(avg));
-    setPhase('result');
+      beatsRef.current[beatsRef.current.length - 1].audiblePerf;
+    const refillAtPerf = lastBeatPerf - 3 * beatSec * 1000;
+    const refillDelayMs = Math.max(0, refillAtPerf - performance.now());
+    if (refillTimerRef.current) clearTimeout(refillTimerRef.current);
+    refillTimerRef.current = setTimeout(() => {
+      if (!stoppedRef.current) scheduleChunk(CHUNK_SIZE);
+    }, refillDelayMs);
   }, []);
 
+  const start = useCallback(() => {
+    teardown();
+    stoppedRef.current = false;
+    beatsRef.current = [];
+    matchedRef.current = new Set();
+    offsetsRef.current = [];
+    setGoodCount(0);
+    setResidualMs(null);
+    setPhase('running');
+    scheduleChunk(CHUNK_SIZE);
+  }, [scheduleChunk, teardown]);
+
   const onTap = useCallback(() => {
-    if (phase !== 'leadin' && phase !== 'running') return;
-    tapPerfTimesRef.current.push(performance.now());
-  }, [phase]);
+    if (phase !== 'running') return;
+    const tapPerf = performance.now();
+    const beats = beatsRef.current;
+
+    // Find nearest beat that hasn't already been matched. Scanning
+    // forward is fine — the schedule is dense (~600ms per beat) and
+    // bounded by CHUNK_SIZE ahead.
+    let nearestIdx = -1;
+    let nearestDist = Infinity;
+    for (let i = 0; i < beats.length; i++) {
+      if (matchedRef.current.has(i)) continue;
+      const dist = Math.abs(tapPerf - beats[i].audiblePerf);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearestIdx = i;
+      }
+    }
+
+    if (nearestIdx < 0 || nearestDist > VALID_WINDOW_MS) {
+      // Random tap, doesn't match a beat — ignore. The user gets
+      // visible feedback via the press animation but no progress.
+      return;
+    }
+    matchedRef.current.add(nearestIdx);
+    const offset = tapPerf - beats[nearestIdx].audiblePerf;
+    offsetsRef.current.push(offset);
+    const count = offsetsRef.current.length;
+    setGoodCount(count);
+
+    // Need DROP_FIRST_GOOD discarded + TARGET_GOOD_TAPS counted = total
+    // before we can finalize. Without DROP_FIRST_GOOD this is just
+    // TARGET_GOOD_TAPS.
+    if (count >= TARGET_GOOD_TAPS + DROP_FIRST_GOOD) {
+      finalize();
+    }
+  }, [phase, finalize]);
 
   const acceptResult = useCallback(() => {
     if (residualMs !== null) {
@@ -155,12 +199,12 @@ export default function CalibrationScreen({ onBack }: Props) {
   const reset = useCallback(() => {
     teardown();
     setPhase('intro');
-    setBeatIdx(0);
+    setGoodCount(0);
     setResidualMs(null);
   }, [teardown]);
 
-  const tapDisabled = phase !== 'leadin' && phase !== 'running';
-  const tapTotal = tapPerfTimesRef.current.length;
+  const usableTarget = TARGET_GOOD_TAPS;
+  const usableCount = Math.max(0, goodCount - DROP_FIRST_GOOD);
 
   return (
     <Chrome>
@@ -173,8 +217,9 @@ export default function CalibrationScreen({ onBack }: Props) {
         {phase === 'intro' && (
           <View style={styles.center}>
             <Text style={styles.instructions}>
-              Put on your headphones and find a quiet moment. We'll play 6
-              clicks at a slow tempo — tap the big button on each click.
+              Put on your headphones. The metronome will keep clicking — tap
+              the big button along with the beat. We'll auto-finish once
+              we have enough good taps.
             </Text>
             <Text style={styles.hint}>
               This calibrates for your output latency, especially helpful
@@ -191,23 +236,27 @@ export default function CalibrationScreen({ onBack }: Props) {
           </View>
         )}
 
-        {(phase === 'leadin' || phase === 'running') && (
+        {phase === 'running' && (
           <View style={styles.center}>
             <Text style={styles.beatCount}>
-              {beatIdx} / {N_BEATS}
+              {usableCount} / {usableTarget}
             </Text>
             <Pressable
               onPressIn={onTap}
-              disabled={tapDisabled}
               style={({ pressed }) => [
                 styles.tapBox,
                 pressed && styles.tapBoxPressed,
               ]}
             >
               <Text style={styles.tapLabel}>TAP</Text>
-              <Text style={styles.tapHint}>each time you hear a click</Text>
+              <Text style={styles.tapHint}>each click</Text>
             </Pressable>
-            <Text style={styles.hint}>{tapTotal} taps so far</Text>
+            <RetroButton
+              label="Stop"
+              onPress={finalize}
+              size="md"
+              variant="danger"
+            />
           </View>
         )}
 
@@ -241,7 +290,8 @@ export default function CalibrationScreen({ onBack }: Props) {
               <>
                 <Text style={styles.resultLabel}>NOT ENOUGH TAPS</Text>
                 <Text style={styles.hint}>
-                  Couldn't get a reading — give it another go.
+                  No taps landed on the beat. Try again — you'll see a
+                  counter tick up as your taps line up with each click.
                 </Text>
                 <RetroButton label="Try again" onPress={reset} size="md" />
               </>
