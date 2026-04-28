@@ -973,7 +973,6 @@ function DoneView({
           onToggle={onToggleYourTake}
         />
       </View>
-      <SyncNudge value={syncOffsetMs} onChange={onChangeSyncOffset} />
       <View style={styles.controlRow}>
         <RetroButton label="Replay" icon="play" onPress={onReplay} size="md" />
         <RetroButton label="Again" onPress={onAgain} size="md" />

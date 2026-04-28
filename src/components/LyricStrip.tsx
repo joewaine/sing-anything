@@ -185,7 +185,7 @@ const styles = StyleSheet.create({
   strip: {
     paddingHorizontal: 16,
     paddingVertical: 4,
-    alignItems: 'flex-start',
+    alignItems: 'stretch',
     width: '100%',
   },
   box: {
@@ -195,7 +195,13 @@ const styles = StyleSheet.create({
     ...SHADOW_1BIT,
     backgroundColor: COLORS.white,
     overflow: 'hidden',
-    minWidth: '50%',
+    // Box fills the container width and clips long lyric lines via
+    // overflow:hidden + numberOfLines={1} on each inner <Text>.
+    // Without an explicit width the box previously expanded to fit
+    // the longest line, sometimes pushing past the viewport on
+    // small screens.
+    width: '100%',
+    maxWidth: '100%',
   },
   inner: {
     // transform translateY scrolls the contained lines up as the
@@ -209,6 +215,9 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     lineHeight: LINE_HEIGHT,
     color: COLORS.black,
+    // Each line constrained to the box width so numberOfLines={1}
+    // produces an ellipsis instead of expanding the box.
+    width: '100%',
   },
   active: {
     backgroundColor: COLORS.black,
