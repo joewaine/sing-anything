@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, Text, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import FontLoader from './src/components/FontLoader';
+import CalibrationScreen from './src/screens/CalibrationScreen';
 import LibraryScreen from './src/screens/LibraryScreen';
 import PasskeyScreen from './src/screens/PasskeyScreen';
 import PickerScreen from './src/screens/PickerScreen';
@@ -167,6 +168,7 @@ export default function App() {
           onUpload={() => setRoute({ screen: 'upload' })}
           onPickSong={(song) => setRoute({ screen: 'picker', songId: song.id })}
           onYourTakes={() => setRoute({ screen: 'takes' })}
+          onCalibrate={() => setRoute({ screen: 'calibrate' })}
           onSignOut={() => {
             void signOut();
             // onAuthStateChange will fire SIGNED_OUT and flip `unlocked`,
@@ -176,6 +178,8 @@ export default function App() {
         />
       ) : route.screen === 'takes' ? (
         <TakesScreen onBack={() => setRoute({ screen: 'library' })} />
+      ) : route.screen === 'calibrate' ? (
+        <CalibrationScreen onBack={() => setRoute({ screen: 'library' })} />
       ) : route.screen === 'upload' ? (
         <UploadScreen
           onBack={() => setRoute({ screen: 'library' })}

@@ -19,6 +19,7 @@ type Props = {
   onUpload: () => void;
   onPickSong: (song: Song) => void;
   onYourTakes?: () => void;
+  onCalibrate?: () => void;
   onBack?: () => void;
   onSignOut?: () => void;
 };
@@ -31,7 +32,7 @@ const STATUS_LABEL: Record<Song['status'], string> = {
   error: 'Error',
 };
 
-export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onBack, onSignOut }: Props) {
+export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCalibrate, onBack, onSignOut }: Props) {
   const [songs, setSongs] = useState<Song[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -138,6 +139,9 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onBac
           <Text style={styles.title}>Your library</Text>
           <View style={styles.headerActions}>
             {onSignOut && <RetroButton label="Sign out" onPress={onSignOut} size="sm" />}
+            {onCalibrate && (
+              <RetroButton label="Audio sync" onPress={onCalibrate} size="sm" />
+            )}
             {onYourTakes && (
               <RetroButton label="Your takes" onPress={onYourTakes} size="sm" />
             )}
