@@ -363,15 +363,21 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, [leadVocalEnabled]);
   // Your-take gain: ramped on the recording's GainNode in the same
   // 30ms window phraseLoop uses, so the toggle feels consistent.
+  // ALSO gated on `analysis !== null`: keep the take silent until
+  // pitch analysis lands with detected_offset_ms, so the user
+  // doesn't hear the recording at the wrong sync (which sounds
+  // broken). Once analysis returns, the rebuild-on-analysis effect
+  // re-anchors the buffer; this gain effect simultaneously unmutes.
   useEffect(() => {
     const gain = recordingGainRef.current;
     const ctx = getAudioContext();
     if (!gain || !ctx) return;
     const t = ctx.currentTime;
+    const target = yourTakeEnabled && analysis !== null ? 1.0 : 0;
     gain.gain.cancelScheduledValues(t);
     gain.gain.setValueAtTime(gain.gain.value, t);
-    gain.gain.linearRampToValueAtTime(yourTakeEnabled ? 1.0 : 0, t + 0.03);
-  }, [yourTakeEnabled]);
+    gain.gain.linearRampToValueAtTime(target, t + 0.03);
+  }, [yourTakeEnabled, analysis]);
 
   // Rebuild on either the manual sync nudge OR the auto-detected
   // offset arriving (analysis is async — completes a few seconds
@@ -502,7 +508,11 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       source.buffer = aligned;
       source.loop = true;
       const gain = ctx.createGain();
-      gain.gain.value = settingsRef.current.yourTakeEnabled ? 1.0 : 0;
+      // Start muted — the gain useEffect will ramp up once pitch
+      // analysis arrives with detected_offset_ms. Avoids playing the
+      // un-synced take audibly during the few seconds analysis is
+      // running.
+      gain.gain.value = 0;
       source.connect(gain).connect(ctx.destination);
       source.start(commonStartAt);
       recordingSourceRef.current = source;
@@ -753,10 +763,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
                 onToggle={() => setLeadVocalEnabled((v) => !v)}
               />
             </View>
-            <BackingVolumeControl
-              value={backingVolume}
-              onChange={setBackingVolume}
-            />
           </View>
         )}
         {stage === 'done' && (
@@ -941,10 +947,6 @@ function DoneView({
           onToggle={onToggleYourTake}
         />
       </View>
-      <BackingVolumeControl
-        value={backingVolume}
-        onChange={onChangeBackingVolume}
-      />
       <SyncNudge value={syncOffsetMs} onChange={onChangeSyncOffset} />
       <View style={styles.controlRow}>
         <RetroButton label="Replay" icon="play" onPress={onReplay} size="md" />

@@ -17,11 +17,6 @@ import {
   type TakeRow,
 } from '../lib/attempts';
 import { startTakePlayback, type TakePlaybackHandle } from '../lib/takePlayback';
-import {
-  useSyncOffset,
-  SYNC_OFFSET_MIN_MS,
-  SYNC_OFFSET_MAX_MS,
-} from '../lib/syncOffset';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 type Props = {
@@ -36,34 +31,21 @@ export default function TakesScreen({ onBack }: Props) {
     null,
   );
   const handleRef = useRef<TakePlaybackHandle | null>(null);
-  const [syncOffset, setSyncOffset] = useSyncOffset();
   // Generation counter for in-flight playTake calls. Each click bumps
   // the gen; if the awaits resolve under a stale gen the handle is
   // discarded. Without this, double-clicking Play (or quick switches
   // between rows) could leak two handles and play two tracks at once.
   const playGenRef = useRef(0);
 
-  // Compute the effective offset for a take: auto-detected from
-  // pitch analysis if available + the user's manual nudge. Applied
-  // both at play time and live as the nudge changes.
-  const offsetForTake = useCallback(
-    (take: TakeRow | null): number => {
-      const detected = take?.pitch_analysis?.detected_offset_ms;
-      const auto =
-        typeof detected === 'number' && Number.isFinite(detected)
-          ? detected
-          : 0;
-      return auto + syncOffset;
-    },
-    [syncOffset],
-  );
-
-  // Live update on manual nudge change.
-  useEffect(() => {
-    if (!activeHandle || !activeId) return;
-    const take = takes?.find((t) => t.id === activeId) ?? null;
-    activeHandle.setOffsetMs(offsetForTake(take));
-  }, [syncOffset, activeHandle, activeId, takes, offsetForTake]);
+  // Auto-detected offset from pitch analysis. No manual nudge in this
+  // view (removed for now); takes view applies whatever the
+  // detector found and that's it.
+  const offsetForTake = useCallback((take: TakeRow | null): number => {
+    const detected = take?.pitch_analysis?.detected_offset_ms;
+    return typeof detected === 'number' && Number.isFinite(detected)
+      ? detected
+      : 0;
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -110,6 +92,10 @@ export default function TakesScreen({ onBack }: Props) {
           songId: take.phrase.song_id,
           phraseId: take.phrase.id,
           offsetMs: offsetForTake(take),
+          // Default lead-vocal off in takes view — replaying a take is
+          // about hearing yourself against the music, not against the
+          // reference vocal. User can flip it on via the toggle.
+          vocalsEnabled: false,
         });
         if (myGen !== playGenRef.current) {
           // Superseded by a later play / stop — discard this handle so
@@ -128,7 +114,7 @@ export default function TakesScreen({ onBack }: Props) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [stopActive, syncOffset, offsetForTake],
+    [stopActive, offsetForTake],
   );
 
   const removeTake = useCallback(
@@ -203,8 +189,6 @@ export default function TakesScreen({ onBack }: Props) {
                 onPlay={() => playTake(item)}
                 onStop={stopActive}
                 onDelete={() => removeTake(item)}
-                syncOffset={syncOffset}
-                onChangeSyncOffset={setSyncOffset}
               />
             )}
           />
@@ -221,8 +205,6 @@ function TakeRowView({
   onPlay,
   onStop,
   onDelete,
-  syncOffset,
-  onChangeSyncOffset,
 }: {
   take: TakeRow;
   isActive: boolean;
@@ -230,13 +212,13 @@ function TakeRowView({
   onPlay: () => void;
   onStop: () => void;
   onDelete: () => void;
-  syncOffset: number;
-  onChangeSyncOffset: (ms: number) => void;
 }) {
   // Toggle states are local to a row that's actively playing — they
   // stay in sync with the live handle's gains via the setter calls.
   const [backing, setBacking] = useState(true);
-  const [vocals, setVocals] = useState(true);
+  // Default lead vocal OFF — replaying a take is about hearing
+  // yourself against the music, not against the reference vocal.
+  const [vocals, setVocals] = useState(false);
   const [take_, setTake] = useState(true);
   // Scrubber position. Updated from the playback handle's tick at
   // ~10Hz to keep state churn down; on drag we override locally and
@@ -247,7 +229,7 @@ function TakeRowView({
   useEffect(() => {
     if (!isActive) {
       setBacking(true);
-      setVocals(true);
+      setVocals(false);
       setTake(true);
       setPositionMs(0);
       setDraggingSeek(null);
@@ -355,68 +337,8 @@ function TakeRowView({
               onToggle={() => setTake((v) => !v)}
             />
           </View>
-          <SyncNudge value={syncOffset} onChange={onChangeSyncOffset} />
         </>
       )}
-    </View>
-  );
-}
-
-function SyncNudge({
-  value,
-  onChange,
-}: {
-  value: number;
-  onChange: (ms: number) => void;
-}) {
-  // Range input slider for ±10s sync nudge — wide enough to be useful
-  // for serious latency compensation or to slide the take into another
-  // section of the song. Web-only; native would need a slider package.
-  if (Platform.OS !== 'web') return null;
-
-  const sign = value > 0 ? '+' : '';
-  const sliderEl = createElement('input', {
-    type: 'range',
-    min: SYNC_OFFSET_MIN_MS,
-    max: SYNC_OFFSET_MAX_MS,
-    step: 50,
-    value,
-    onChange: (e: any) => onChange(Number(e.target.value)),
-    style: {
-      width: '100%',
-      accentColor: '#000',
-      cursor: 'pointer',
-    },
-  });
-
-  const fmt = (ms: number): string => {
-    if (Math.abs(ms) < 1000) return `${ms}ms`;
-    return `${(ms / 1000).toFixed(2)}s`;
-  };
-
-  return (
-    <View>
-      <View style={styles.syncRow}>
-        <Text style={styles.syncLabel}>SYNC</Text>
-        <Text style={styles.syncValue}>
-          {sign}
-          {fmt(value)}
-        </Text>
-        <Pressable
-          onPress={() => onChange(0)}
-          style={({ pressed }) => [
-            styles.syncResetBtn,
-            pressed && styles.syncResetBtnPressed,
-          ]}
-          hitSlop={6}
-        >
-          <Text style={styles.syncResetLabel}>RESET</Text>
-        </Pressable>
-      </View>
-      <View style={styles.scrubberFlex}>{sliderEl}</View>
-      <Text style={styles.syncHint}>
-        Slide right if your voice sounds early; left if late.
-      </Text>
     </View>
   );
 }

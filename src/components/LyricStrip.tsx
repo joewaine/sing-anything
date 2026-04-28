@@ -18,11 +18,11 @@ type Props = {
 const LINE_BREAK_GAP_MS = 600;
 // Lyric box shows at most VISIBLE_LINES rows; the rest is clipped via
 // overflow:hidden and a translateY transform that scrolls the viewport
-// so the active line stays near the top. Lets long phrases / whole-
-// song clips fit a fixed-height box without crowding the controls
-// below.
-const VISIBLE_LINES = 4;
-const LINE_HEIGHT = 20;
+// so the active line stays near the top. 3 lines = past + active +
+// upcoming, with the active line biased to row 1 (middle) so the next
+// line is always in view.
+const VISIBLE_LINES = 3;
+const LINE_HEIGHT = 22;
 
 /**
  * Renders the phrase lyric as individual syllables; when `active`, runs its own
@@ -111,11 +111,28 @@ export default function LyricStrip({
     );
   }
 
-  // Bias: keep the active line at row 1 of 4 visible (one line of past
-  // context above, three of upcoming lyric below). When near the start
-  // or end of the song, clamp so we never scroll past the content.
-  const activeLineIdx =
-    activeIdx === -1 ? 0 : lineByItemIdx.get(activeIdx) ?? 0;
+  // Sticky active-line tracker. The cursor returns -1 between notes
+  // (in gaps), which used to snap activeLineIdx back to 0 — and the
+  // viewport jolted back to the top until the next note hit. We keep
+  // the last-known line until a NEW note arrives, so scrolling only
+  // ever advances forward.
+  const [activeLineIdx, setActiveLineIdx] = useState(0);
+  useEffect(() => {
+    if (activeIdx < 0) return;
+    const fresh = lineByItemIdx.get(activeIdx);
+    if (fresh !== undefined && fresh !== activeLineIdx) {
+      setActiveLineIdx(fresh);
+    }
+  }, [activeIdx, lineByItemIdx, activeLineIdx]);
+  // Reset to the start when the lyric content changes (new phrase).
+  useEffect(() => {
+    setActiveLineIdx(0);
+  }, [lines]);
+
+  // Active stays at row 1 (middle) of the 3-line viewport whenever
+  // possible — one past line, active, one upcoming. At the very start
+  // (activeLineIdx 0) row 0 is shown with no past context; at the
+  // very end the bottom of the lyric anchors the window.
   const maxStart = Math.max(0, lines.length - VISIBLE_LINES);
   const startLine = Math.max(0, Math.min(maxStart, activeLineIdx - 1));
   const translateY = -startLine * LINE_HEIGHT;
@@ -125,7 +142,24 @@ export default function LyricStrip({
   return (
     <View style={styles.strip}>
       <View style={[styles.box, { height: visibleHeight + 8 }]}>
-        <View style={[styles.inner, { transform: [{ translateY }] }]}>
+        <View
+          style={[
+            styles.inner,
+            // Inline transition so RN web doesn't strip it. translateY
+            // updates step by 1 line at a time as activeLineIdx
+            // advances; the CSS transition makes the scroll smooth
+            // instead of jumping.
+            {
+              transform: [{ translateY }],
+              transitionProperty: 'transform',
+              transitionDuration: '0.4s',
+              transitionTimingFunction: 'ease-out',
+              willChange: 'transform',
+              // RN web passes these through as inline DOM CSS;
+              // native ignores them silently.
+            } as Record<string, unknown>,
+          ]}
+        >
           {lines.map((line, lineIdx) => (
             <Text key={lineIdx} style={styles.line} numberOfLines={1}>
               {line.items.map((x, i) => {
@@ -165,11 +199,9 @@ const styles = StyleSheet.create({
   },
   inner: {
     // transform translateY scrolls the contained lines up as the
-    // active line advances. CSS transition makes the scroll smooth on
-    // web; native falls back to a hard jump (acceptable — the
-    // boundary fires every ~6s).
-    // @ts-expect-error — RN web ignores this on native
-    transition: 'transform 0.25s ease-out',
+    // active line advances. The actual transition props live inline
+    // on the component so they survive RN StyleSheet's filter; this
+    // entry exists only so we have a named style key for layout.
   },
   line: {
     fontFamily: FONTS.monaco,
