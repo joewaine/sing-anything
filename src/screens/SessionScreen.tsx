@@ -24,29 +24,23 @@ import {
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 /**
- * Build the aligned (loop-length, head-shifted) recording buffer.
- * `extraOffsetMs` is the user-adjustable sync nudge — layered on top
- * of the auto-detected output latency to cope with Bluetooth headphone
- * latency the browser may under-report. Pulled into a file-level
- * helper so the syncOffset effect can rebuild without re-fetching
- * the recording or duplicating the math from takePlayback.ts.
+ * Build the aligned (loop-length, shifted) recording buffer.
+ * `totalOffsetMs` is the full shift to apply: positive pads the start
+ * with silence (voice plays later), negative trims the head (voice
+ * plays earlier). Caller composes the value — typically
+ * (analysis.detected_offset_ms ?? autoFallback) + manual nudge.
  */
 function buildAlignedRecording(
   ctx: AudioContext,
   raw: AudioBuffer,
   loopDurationSec: number,
-  extraOffsetMs: number,
+  totalOffsetMs: number,
 ): AudioBuffer {
   const targetLength = Math.max(
     1,
     Math.round(loopDurationSec * raw.sampleRate),
   );
-  const autoHeadOffsetSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
-  const totalOffsetSec = Math.max(0, autoHeadOffsetSec + extraOffsetMs / 1000);
-  const headOffsetSamples = Math.max(
-    0,
-    Math.round(totalOffsetSec * raw.sampleRate),
-  );
+  const shiftSamples = Math.round((totalOffsetMs / 1000) * raw.sampleRate);
   const aligned = ctx.createBuffer(
     raw.numberOfChannels,
     targetLength,
@@ -55,12 +49,37 @@ function buildAlignedRecording(
   for (let ch = 0; ch < raw.numberOfChannels; ch++) {
     const src = raw.getChannelData(ch);
     const dst = aligned.getChannelData(ch);
-    const copyLen = Math.min(src.length, targetLength - headOffsetSamples);
-    if (copyLen > 0) {
-      dst.set(src.subarray(0, copyLen), headOffsetSamples);
+    if (shiftSamples >= 0) {
+      const copyLen = Math.min(src.length, targetLength - shiftSamples);
+      if (copyLen > 0) dst.set(src.subarray(0, copyLen), shiftSamples);
+    } else {
+      const srcStart = Math.min(src.length, -shiftSamples);
+      const copyLen = Math.min(src.length - srcStart, targetLength);
+      if (copyLen > 0) dst.set(src.subarray(srcStart, srcStart + copyLen), 0);
     }
   }
   return aligned;
+}
+
+/**
+ * Resolve the total offset for done-view playback. Auto-detected
+ * value from pitch analysis takes priority (when available); falls
+ * back to the historical 0.05 + outputLatency formula otherwise.
+ * The user's manual nudge layers on top.
+ */
+function resolveTotalOffsetMs(
+  ctx: AudioContext | null,
+  analysis: PitchAnalysis | null,
+  manualOffsetMs: number,
+): number {
+  const detected = analysis?.detected_offset_ms;
+  if (typeof detected === 'number' && Number.isFinite(detected)) {
+    return detected + manualOffsetMs;
+  }
+  const autoFallback = ctx
+    ? (0.05 + Math.max(0, ctx.outputLatency ?? 0)) * 1000
+    : 0;
+  return autoFallback + manualOffsetMs;
 }
 
 // Stages:
@@ -354,10 +373,10 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     gain.gain.linearRampToValueAtTime(yourTakeEnabled ? 1.0 : 0, t + 0.03);
   }, [yourTakeEnabled]);
 
-  // Sync nudge: rebuild the aligned recording buffer with the new
-  // offset and restart the take source at the current loop position.
-  // Backing keeps playing — only the take is re-anchored. No-op if
-  // we're not currently in done view (no source/buffer yet).
+  // Rebuild on either the manual sync nudge OR the auto-detected
+  // offset arriving (analysis is async — completes a few seconds
+  // after the take ends). Backing keeps playing untouched; only
+  // the take re-anchors at the current loop position.
   useEffect(() => {
     const ctx = getAudioContext();
     const raw = recordingRawBufferRef.current;
@@ -365,11 +384,12 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     const oldSrc = recordingSourceRef.current;
     const gain = recordingGainRef.current;
     if (!ctx || !raw || !phraseLoop || !gain) return;
+    const totalOffsetMs = resolveTotalOffsetMs(ctx, analysis, syncOffsetMs);
     const aligned = buildAlignedRecording(
       ctx,
       raw,
       phrase.duration_ms / 1000,
-      syncOffsetMs,
+      totalOffsetMs,
     );
     const positionMs = phraseLoop.getPositionMs();
     const positionSec = Math.max(
@@ -389,7 +409,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     s.connect(gain);
     s.start(ctx.currentTime + 0.02, positionSec);
     recordingSourceRef.current = s;
-  }, [syncOffsetMs, phrase.duration_ms]);
+  }, [syncOffsetMs, phrase.duration_ms, analysis]);
 
   // Start (or restart) playback of the just-recorded take alongside a
   // looping phrase backing track. On web both sources are scheduled at
@@ -460,15 +480,23 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     }
 
     if (ctx && recordingBuffer) {
-      // Stash raw buffer so the syncOffset nudge can rebuild without
-      // re-fetching the recording.
+      // Stash raw buffer so the syncOffset / analysis effects can
+      // rebuild without re-fetching the recording.
       recordingRawBufferRef.current = recordingBuffer;
       const phraseSec = phrase.duration_ms / 1000;
+      // Initial total offset uses whatever analysis we have (likely
+      // null at this point — analysis runs async). The rebuild
+      // useEffect picks it up once analysis completes.
+      const initialOffsetMs = resolveTotalOffsetMs(
+        ctx,
+        null,
+        settingsRef.current.syncOffsetMs,
+      );
       const aligned = buildAlignedRecording(
         ctx,
         recordingBuffer,
         phraseSec,
-        settingsRef.current.syncOffsetMs,
+        initialOffsetMs,
       );
       const source = ctx.createBufferSource();
       source.buffer = aligned;

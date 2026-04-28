@@ -10,11 +10,15 @@ import {
 } from 'react-native';
 import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
-import { listAttempts, signTakeUrls, type TakeRow } from '../lib/attempts';
+import {
+  deleteAttempt,
+  listAttempts,
+  signTakeUrls,
+  type TakeRow,
+} from '../lib/attempts';
 import { startTakePlayback, type TakePlaybackHandle } from '../lib/takePlayback';
 import {
   useSyncOffset,
-  SYNC_OFFSET_STEP_MS,
   SYNC_OFFSET_MIN_MS,
   SYNC_OFFSET_MAX_MS,
 } from '../lib/syncOffset';
@@ -39,10 +43,27 @@ export default function TakesScreen({ onBack }: Props) {
   // between rows) could leak two handles and play two tracks at once.
   const playGenRef = useRef(0);
 
-  // Apply latest sync nudge to the active handle without restarting.
+  // Compute the effective offset for a take: auto-detected from
+  // pitch analysis if available + the user's manual nudge. Applied
+  // both at play time and live as the nudge changes.
+  const offsetForTake = useCallback(
+    (take: TakeRow | null): number => {
+      const detected = take?.pitch_analysis?.detected_offset_ms;
+      const auto =
+        typeof detected === 'number' && Number.isFinite(detected)
+          ? detected
+          : 0;
+      return auto + syncOffset;
+    },
+    [syncOffset],
+  );
+
+  // Live update on manual nudge change.
   useEffect(() => {
-    activeHandle?.setExtraOffsetMs(syncOffset);
-  }, [syncOffset, activeHandle]);
+    if (!activeHandle || !activeId) return;
+    const take = takes?.find((t) => t.id === activeId) ?? null;
+    activeHandle.setOffsetMs(offsetForTake(take));
+  }, [syncOffset, activeHandle, activeId, takes, offsetForTake]);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,7 +109,7 @@ export default function TakesScreen({ onBack }: Props) {
           loopDurationSec: take.phrase.duration_ms / 1000,
           songId: take.phrase.song_id,
           phraseId: take.phrase.id,
-          extraOffsetMs: syncOffset,
+          offsetMs: offsetForTake(take),
         });
         if (myGen !== playGenRef.current) {
           // Superseded by a later play / stop — discard this handle so
@@ -107,7 +128,25 @@ export default function TakesScreen({ onBack }: Props) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [stopActive, syncOffset],
+    [stopActive, syncOffset, offsetForTake],
+  );
+
+  const removeTake = useCallback(
+    async (take: TakeRow) => {
+      if (typeof window !== 'undefined' && window.confirm) {
+        const ok = window.confirm('Delete this take? This cannot be undone.');
+        if (!ok) return;
+      }
+      // If the row being deleted is currently playing, stop it.
+      if (activeId === take.id) stopActive();
+      try {
+        await deleteAttempt(take);
+        setTakes((prev) => (prev ? prev.filter((t) => t.id !== take.id) : prev));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [activeId, stopActive],
   );
 
   // Stop active playback when the tab is hidden (user switches tabs,
@@ -163,6 +202,7 @@ export default function TakesScreen({ onBack }: Props) {
                 handle={item.id === activeId ? activeHandle : null}
                 onPlay={() => playTake(item)}
                 onStop={stopActive}
+                onDelete={() => removeTake(item)}
                 syncOffset={syncOffset}
                 onChangeSyncOffset={setSyncOffset}
               />
@@ -180,6 +220,7 @@ function TakeRowView({
   handle,
   onPlay,
   onStop,
+  onDelete,
   syncOffset,
   onChangeSyncOffset,
 }: {
@@ -188,6 +229,7 @@ function TakeRowView({
   handle: TakePlaybackHandle | null;
   onPlay: () => void;
   onStop: () => void;
+  onDelete: () => void;
   syncOffset: number;
   onChangeSyncOffset: (ms: number) => void;
 }) {
@@ -272,6 +314,16 @@ function TakeRowView({
         ) : (
           <RetroButton label="▶ Play" onPress={onPlay} size="md" />
         )}
+        <Pressable
+          onPress={onDelete}
+          style={({ pressed }) => [
+            styles.deleteBtn,
+            pressed && styles.deleteBtnPressed,
+          ]}
+          hitSlop={6}
+        >
+          <Text style={styles.deleteBtnLabel}>×</Text>
+        </Pressable>
       </View>
       {isActive && (
         <>
@@ -317,33 +369,54 @@ function SyncNudge({
   value: number;
   onChange: (ms: number) => void;
 }) {
+  // Range input slider for ±10s sync nudge — wide enough to be useful
+  // for serious latency compensation or to slide the take into another
+  // section of the song. Web-only; native would need a slider package.
+  if (Platform.OS !== 'web') return null;
+
   const sign = value > 0 ? '+' : '';
+  const sliderEl = createElement('input', {
+    type: 'range',
+    min: SYNC_OFFSET_MIN_MS,
+    max: SYNC_OFFSET_MAX_MS,
+    step: 50,
+    value,
+    onChange: (e: any) => onChange(Number(e.target.value)),
+    style: {
+      width: '100%',
+      accentColor: '#000',
+      cursor: 'pointer',
+    },
+  });
+
+  const fmt = (ms: number): string => {
+    if (Math.abs(ms) < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(2)}s`;
+  };
+
   return (
-    <View style={styles.syncRow}>
-      <Text style={styles.syncLabel}>SYNC</Text>
-      <Pressable
-        onPress={() =>
-          onChange(Math.max(SYNC_OFFSET_MIN_MS, value - SYNC_OFFSET_STEP_MS))
-        }
-        style={({ pressed }) => [styles.syncBtn, pressed && styles.syncBtnPressed]}
-        hitSlop={6}
-      >
-        <Text style={styles.syncBtnLabel}>−</Text>
-      </Pressable>
-      <Text style={styles.syncValue}>
-        {sign}
-        {value} ms
+    <View>
+      <View style={styles.syncRow}>
+        <Text style={styles.syncLabel}>SYNC</Text>
+        <Text style={styles.syncValue}>
+          {sign}
+          {fmt(value)}
+        </Text>
+        <Pressable
+          onPress={() => onChange(0)}
+          style={({ pressed }) => [
+            styles.syncResetBtn,
+            pressed && styles.syncResetBtnPressed,
+          ]}
+          hitSlop={6}
+        >
+          <Text style={styles.syncResetLabel}>RESET</Text>
+        </Pressable>
+      </View>
+      <View style={styles.scrubberFlex}>{sliderEl}</View>
+      <Text style={styles.syncHint}>
+        Slide right if your voice sounds early; left if late.
       </Text>
-      <Pressable
-        onPress={() =>
-          onChange(Math.min(SYNC_OFFSET_MAX_MS, value + SYNC_OFFSET_STEP_MS))
-        }
-        style={({ pressed }) => [styles.syncBtn, pressed && styles.syncBtnPressed]}
-        hitSlop={6}
-      >
-        <Text style={styles.syncBtnLabel}>+</Text>
-      </Pressable>
-      <Text style={styles.syncHint}>+ if your voice sounds early</Text>
     </View>
   );
 }
@@ -521,7 +594,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexWrap: 'wrap',
     gap: 8,
-    marginTop: 4,
+    marginTop: 6,
   },
   syncLabel: {
     fontFamily: FONTS.chicago,
@@ -530,36 +603,53 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
     color: COLORS.black,
   },
-  syncBtn: {
-    width: 22,
-    height: 22,
-    alignItems: 'center',
-    justifyContent: 'center',
-    ...BORDER_1BIT,
-    backgroundColor: COLORS.white,
-  },
-  syncBtnPressed: {
-    transform: [{ translateX: 1 }, { translateY: 1 }],
-  },
-  syncBtnLabel: {
-    fontFamily: FONTS.chicago,
-    fontWeight: '700',
-    fontSize: 14,
-    color: COLORS.black,
-    lineHeight: 14,
-  },
   syncValue: {
     fontFamily: FONTS.monaco,
     fontSize: 11,
-    minWidth: 56,
-    textAlign: 'center',
+    minWidth: 64,
+    textAlign: 'left',
+    color: COLORS.black,
+  },
+  syncResetBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  syncResetBtnPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  syncResetLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 9,
+    letterSpacing: 1,
     color: COLORS.black,
   },
   syncHint: {
     fontFamily: FONTS.monaco,
     fontSize: 10,
     color: COLORS.softGrey,
-    flex: 1,
+    marginTop: 2,
+  },
+  deleteBtn: {
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+  },
+  deleteBtnPressed: {
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+    backgroundColor: '#ff3b30',
+  },
+  deleteBtnLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 18,
+    color: COLORS.black,
+    lineHeight: 18,
   },
   chip: {
     paddingHorizontal: 10,

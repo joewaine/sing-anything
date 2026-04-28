@@ -19,12 +19,12 @@ export type TakePlaybackHandle = {
   getPositionMs: () => number;
   /** Total loop duration in ms — useful for sizing a slider track. */
   getDurationMs: () => number;
-  /** Adjust the user-take's sync offset in ms — layered on top of the
-   *  auto-detected output latency. Positive = shift voice later
-   *  (compensate for Bluetooth output lag that the browser
-   *  under-reports). Rebuilds the aligned recording buffer and
-   *  restarts the take source at the current loop position. */
-  setExtraOffsetMs: (ms: number) => void;
+  /** Set the take's total shift in ms. Positive = pad start with
+   *  silence (voice plays later). Negative = trim head (voice plays
+   *  earlier). Rebuilds the aligned recording buffer and restarts
+   *  the take source at the current loop position; backing keeps
+   *  playing untouched. */
+  setOffsetMs: (ms: number) => void;
 };
 
 export type TakePlaybackOptions = {
@@ -38,8 +38,11 @@ export type TakePlaybackOptions = {
   backingVolume?: number;
   songId?: string;
   phraseId?: string;
-  /** Initial extra sync offset in ms (user-adjustable nudge). */
-  extraOffsetMs?: number;
+  /** Total shift applied to the take in ms. Caller computes — typical
+   *  pattern: (analysis.detected_offset_ms ?? autoFallback) +
+   *  user's manual nudge. Positive = pad start (voice later);
+   *  negative = trim head (voice earlier). */
+  offsetMs?: number;
 };
 
 const RAMP_SEC = 0.03;
@@ -84,22 +87,30 @@ export async function startTakePlayback(
   });
   if (!phraseHandle) return null;
 
-  // Pad/trim recording to loop length AND shift content right by the
-  // recording-time latency gap so playback syncs with the backing.
-  // See full explanation below the buildAligned definition.
-  const autoHeadOffsetSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
-  let currentExtraOffsetMs = opts.extraOffsetMs ?? 0;
+  // Pad/trim recording to loop length AND shift content by the total
+  // offset the caller asked for. The shift is applied bidirectionally:
+  //   shiftSec > 0 → aligned[shift..end] = recording[0..end-shift];
+  //                  aligned[0..shift] = silence (voice plays later).
+  //   shiftSec < 0 → aligned[0..end] = recording[|shift|..|shift|+end];
+  //                  trim the head (voice plays earlier).
+  //
+  // shiftSec defaults to 0.05 + ctx.outputLatency only when the caller
+  // didn't supply offsetMs. With analysis-driven detection the caller
+  // computes the total directly and passes it.
+  const autoFallbackSec = 0.05 + Math.max(0, ctx.outputLatency ?? 0);
+  let currentOffsetMs =
+    opts.offsetMs !== undefined && opts.offsetMs !== null
+      ? opts.offsetMs
+      : autoFallbackSec * 1000;
 
-  const buildAligned = (extraOffsetMs: number): AudioBuffer | null => {
+  const buildAligned = (offsetMs: number): AudioBuffer | null => {
     if (!recordingBuffer) return null;
     const targetLength = Math.max(
       1,
       Math.round(opts.loopDurationSec * recordingBuffer.sampleRate),
     );
-    const totalOffsetSec = Math.max(0, autoHeadOffsetSec + extraOffsetMs / 1000);
-    const headOffsetSamples = Math.max(
-      0,
-      Math.round(totalOffsetSec * recordingBuffer.sampleRate),
+    const shiftSamples = Math.round(
+      (offsetMs / 1000) * recordingBuffer.sampleRate,
     );
     const aligned = ctx.createBuffer(
       recordingBuffer.numberOfChannels,
@@ -109,27 +120,23 @@ export async function startTakePlayback(
     for (let ch = 0; ch < recordingBuffer.numberOfChannels; ch++) {
       const src = recordingBuffer.getChannelData(ch);
       const dst = aligned.getChannelData(ch);
-      const copyLen = Math.min(src.length, targetLength - headOffsetSamples);
-      if (copyLen > 0) {
-        dst.set(src.subarray(0, copyLen), headOffsetSamples);
+      if (shiftSamples >= 0) {
+        const copyLen = Math.min(src.length, targetLength - shiftSamples);
+        if (copyLen > 0) {
+          dst.set(src.subarray(0, copyLen), shiftSamples);
+        }
+      } else {
+        const srcStart = Math.min(src.length, -shiftSamples);
+        const copyLen = Math.min(src.length - srcStart, targetLength);
+        if (copyLen > 0) {
+          dst.set(src.subarray(srcStart, srcStart + copyLen), 0);
+        }
       }
     }
     return aligned;
   };
 
-  // During recording: recorder.start() fires at wall-clock R0 — mic
-  // captures from there. Backing was scheduled at ctx.currentTime +
-  // 0.05 and became audible at scheduled + outputLatency. So the first
-  // audible backing sample reached the user's ear ~0.05 + outputLatency
-  // seconds AFTER recording[0]. The user's voice in recording[t] is
-  // responding to backing[t - autoHeadOffset]. Replay shifts recording
-  // content right by that amount so they align.
-  //
-  // Bluetooth complication: outputLatency may under-report by 100–
-  // 300ms on Bluetooth headphones (browser dependent). The user-
-  // adjustable extraOffsetMs nudge lets the user dial in extra shift
-  // until their voice sounds in pocket.
-  let alignedRecording = buildAligned(currentExtraOffsetMs);
+  let alignedRecording = buildAligned(currentOffsetMs);
 
   // Take's gain lives outside the source — survives seek so toggle
   // state doesn't reset when the user drags the scrubber.
@@ -200,12 +207,12 @@ export async function startTakePlayback(
     },
     getPositionMs: () => phraseHandle.getPositionMs(),
     getDurationMs: () => opts.loopDurationSec * 1000,
-    setExtraOffsetMs(ms) {
+    setOffsetMs(ms) {
       if (stopped || !recordingBuffer) return;
-      if (ms === currentExtraOffsetMs) return;
-      currentExtraOffsetMs = ms;
-      // Rebuild the aligned buffer with the new offset and restart the
-      // take source at the current loop position. Backing keeps
+      if (ms === currentOffsetMs) return;
+      currentOffsetMs = ms;
+      // Rebuild the aligned buffer with the new offset and restart
+      // the take source at the current loop position. Backing keeps
       // playing — we re-anchor only the take.
       alignedRecording = buildAligned(ms);
       const positionMs = phraseHandle.getPositionMs();

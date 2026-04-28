@@ -43,6 +43,20 @@ export async function listAttempts(): Promise<TakeRow[]> {
   return (data ?? []) as unknown as TakeRow[];
 }
 
+export async function deleteAttempt(take: TakeRow): Promise<void> {
+  const supabase = requireSupabase();
+  // Best-effort: drop the audio blob first, then the row. If the
+  // storage delete fails (already gone, RLS), we still try to remove
+  // the row so it disappears from the list.
+  try {
+    await supabase.storage.from('attempts').remove([take.audio_path]);
+  } catch (e) {
+    console.warn('attempt audio delete failed:', e);
+  }
+  const { error } = await supabase.from('attempts').delete().eq('id', take.id);
+  if (error) throw error;
+}
+
 export async function signTakeUrls(take: TakeRow): Promise<{
   recordingUrl: string;
   vocalsUrl: string;

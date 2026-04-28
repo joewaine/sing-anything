@@ -38,6 +38,12 @@ export type PitchAnalysis = {
   worst_note_idx: number | null;
   best_note_idx: number | null;
   overall_offset_cents: number;
+  /** Auto-detected playback offset in ms. The shift that maximises
+   *  voiced frames falling inside reference note windows — i.e. the
+   *  offset that aligns the user's pitch contour with where notes are
+   *  expected. Positive = pad start (delay voice); negative = trim
+   *  head (advance voice). 0 if signal was too sparse to trust. */
+  detected_offset_ms?: number;
 };
 
 function freqToMidi(freq: number): number {
@@ -239,6 +245,67 @@ function octaveFoldedSemitones(actual: number, expected: number): number {
   return d;
 }
 
+/**
+ * Brute-force sync offset detection. Sweep candidate offsets in ±1s,
+ * 10ms steps; for each, count how many voiced frames in the user's
+ * pitch curve fall inside ANY reference note window when shifted by
+ * that offset. The peak offset is what aligns the user's vocal with
+ * the music — a closed-form fix for output-latency drift the browser
+ * may under-report (Bluetooth headphones).
+ *
+ * Sign matches our buildAligned shift convention:
+ *   positive → voice shifts later (pad head with silence),
+ *   negative → voice shifts earlier (trim head).
+ *
+ * Returns 0 when the signal is too sparse, or when the peak isn't
+ * meaningfully better than the no-shift baseline — better to leave
+ * the recording untouched than to nudge it in the wrong direction.
+ */
+function detectBestSyncOffset(
+  curve: PitchSample[],
+  notes: MidiNote[],
+): number {
+  if (curve.length === 0 || notes.length === 0) return 0;
+  const voiced = curve.filter((s) => s.clarity > 0.5);
+  if (voiced.length < 8) return 0;
+
+  const sorted = notes.slice().sort((a, b) => a.start_ms - b.start_ms);
+  const isInNote = (t: number): boolean => {
+    for (let i = 0; i < sorted.length; i++) {
+      const n = sorted[i];
+      if (t < n.start_ms) return false;
+      if (t <= n.end_ms) return true;
+    }
+    return false;
+  };
+
+  let bestOffset = 0;
+  let bestCount = -1;
+  for (let offsetMs = -1000; offsetMs <= 1000; offsetMs += 10) {
+    let count = 0;
+    for (const s of voiced) {
+      if (isInNote(s.time_ms + offsetMs)) count++;
+    }
+    if (count > bestCount) {
+      bestCount = count;
+      bestOffset = offsetMs;
+    }
+  }
+
+  // Safety: peak must improve on the no-shift baseline by at least 5%
+  // of voiced frames. If not, the recording is too noisy / off-pitch
+  // for detection to be reliable — return 0 and let the user nudge
+  // manually if they want.
+  let baselineCount = 0;
+  for (const s of voiced) {
+    if (isInNote(s.time_ms)) baselineCount++;
+  }
+  if (bestCount < baselineCount + voiced.length * 0.05) {
+    return 0;
+  }
+  return bestOffset;
+}
+
 export function compareToReference(
   curve: PitchSample[],
   notes: MidiNote[],
@@ -305,6 +372,7 @@ export function compareToReference(
     notes: analyses,
     worst_note_idx: worst?.idx ?? null,
     best_note_idx: best?.idx ?? null,
+    detected_offset_ms: detectBestSyncOffset(curve, notes),
   };
 }
 

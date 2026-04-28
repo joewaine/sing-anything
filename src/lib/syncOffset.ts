@@ -11,8 +11,11 @@ import { Platform } from 'react-native';
 const KEY = 'sat:syncOffsetMs';
 export const SYNC_OFFSET_DEFAULT_MS = 0;
 export const SYNC_OFFSET_STEP_MS = 50;
-export const SYNC_OFFSET_MIN_MS = -300;
-export const SYNC_OFFSET_MAX_MS = 500;
+// Range bumped to ±10s so users can compensate for very long
+// Bluetooth chains or just slide their take to land in any other
+// part of the song they want to overdub against.
+export const SYNC_OFFSET_MIN_MS = -10000;
+export const SYNC_OFFSET_MAX_MS = 10000;
 
 function readStored(): number {
   if (Platform.OS !== 'web' || typeof localStorage === 'undefined') {
