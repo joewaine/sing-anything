@@ -567,25 +567,24 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     try {
       const { attemptId } = await uploadAndInsert(phrase, uri);
 
-      // Pitch analysis is opt-in — when the Analysis toggle is off
-      // we skip the YIN curve, sync detection, and Claude feedback.
-      // The take is still saved, just unscored. Snapshot the toggle
-      // here so a later flip doesn't mid-flight kick us into a half
-      // analysis path.
-      if (analysisEnabled) {
-        setAnalysisPending(true);
-        runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
-          setAnalysis(a);
-          setAnalysisPending(false);
-          if (a) {
-            setFeedbackPending(true);
-            requestFeedback(attemptId, feedbackInlineFor(phrase, a))
-              .then(setFeedback)
-              .catch((e) => console.warn('feedback request failed:', e))
-              .finally(() => setFeedbackPending(false));
-          }
-        });
-      }
+      // Pitch analysis ALWAYS runs — it's free client-side compute
+      // and computes detected_offset_ms, which auto-syncs the take
+      // on replay (here AND in the takes view). The Analysis toggle
+      // only gates whether we show the score / hit rate in the done
+      // view + whether we request the Claude coach feedback (which
+      // is the only thing that costs real money).
+      setAnalysisPending(true);
+      runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
+        setAnalysis(a);
+        setAnalysisPending(false);
+        if (a && analysisEnabled) {
+          setFeedbackPending(true);
+          requestFeedback(attemptId, feedbackInlineFor(phrase, a))
+            .then(setFeedback)
+            .catch((e) => console.warn('feedback request failed:', e))
+            .finally(() => setFeedbackPending(false));
+        }
+      });
     } catch (e: unknown) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
@@ -791,6 +790,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
             analysisPending={analysisPending}
             feedback={feedback}
             feedbackPending={feedbackPending}
+            analysisEnabled={analysisEnabled}
             onAgain={again}
             onReplay={replayTake}
             backingEnabled={backingEnabled}
@@ -881,6 +881,7 @@ function DoneView({
   analysisPending,
   feedback,
   feedbackPending,
+  analysisEnabled,
   onAgain,
   onReplay,
   backingEnabled,
@@ -898,6 +899,7 @@ function DoneView({
   analysisPending: boolean;
   feedback: FeedbackResult | null;
   feedbackPending: boolean;
+  analysisEnabled: boolean;
   onAgain: () => void;
   onReplay: () => void;
   backingEnabled: boolean;
@@ -921,9 +923,13 @@ function DoneView({
         : analysis.overall_offset_cents > 0
           ? 'sharp'
           : 'flat';
+  // Score + feedback are gated on the Analysis toggle. Pitch analysis
+  // still runs unconditionally (it's free and computes the auto-sync
+  // offset) — the toggle just controls whether we DISPLAY the score
+  // and request the Claude coach.
   return (
     <View style={styles.doneWrap}>
-      {pct !== null ? (
+      {analysisEnabled && pct !== null ? (
         <View style={{ alignItems: 'center' }}>
           <Text style={styles.pctBig}>{pct}%</Text>
           <View style={styles.onPitchBadge}>
@@ -935,19 +941,19 @@ function DoneView({
             </Text>
           )}
         </View>
-      ) : analysisPending ? (
+      ) : analysisEnabled && analysisPending ? (
         <View style={{ alignItems: 'center' }}>
           <Text style={styles.savedLabel}>SAVED · ANALYZING…</Text>
         </View>
       ) : (
         <Text style={styles.savedLabel}>SAVED</Text>
       )}
-      {feedback ? (
+      {analysisEnabled && feedback ? (
         <View style={styles.feedbackCard}>
           <Text style={styles.feedbackText}>{feedback.feedback}</Text>
           <Text style={styles.feedbackTry}>Try next: {feedback.try_next}</Text>
         </View>
-      ) : feedbackPending ? (
+      ) : analysisEnabled && feedbackPending ? (
         <Text style={styles.feedbackPending}>COACH IS LISTENING…</Text>
       ) : null}
       <View style={styles.toggleRow}>
