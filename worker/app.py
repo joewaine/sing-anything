@@ -372,7 +372,7 @@ def process_song(
         original = tmp_dir / "original.mp3"
 
         if youtube_url:
-            stage("upload", 0.05, "downloading from URL")
+            stage("upload", 0.05, "downloading audio")
             try:
                 yt_info = _yt_download(youtube_url, original)
             except YoutubeBlockedError as e:
@@ -412,7 +412,7 @@ def process_song(
                     updates["artist"] = yt_info["uploader"]
                 sb.table("songs").update(updates).eq("id", song_id).execute()
         else:
-            stage("upload", 0.05, "downloading original")
+            stage("upload", 0.05, "downloading audio")
             _download(original_url, original)
         print(f"[process_song] original = {original.stat().st_size:,} bytes")
 
@@ -443,7 +443,7 @@ def process_song(
                 "status": "stemming",
             }).eq("id", song_id).execute()
 
-        stage("stemming", 0.15, "demucs htdemucs")
+        stage("stemming", 0.15, "separating vocals from music")
         stem_dir = run_demucs(original, tmp_dir / "out")
         vocals = stem_dir / "vocals.wav"
         drums = stem_dir / "drums.wav"
@@ -483,7 +483,7 @@ def process_song(
         from concurrent.futures import ThreadPoolExecutor as _Pool
 
         backing = tmp_dir / "backing.wav"
-        stage("whisper", 0.40, "whisperx + crepe (parallel) + lyric prefetch")
+        stage("whisper", 0.40, "transcribing lyrics and tracking pitch")
 
         with _Pool(max_workers=4) as ex:
             f_whisper = ex.submit(transcribe_words, vocals, "large-v3", vocals_array)
@@ -510,7 +510,7 @@ def process_song(
             words, lyrics_source = verify_lyrics(words, song_name, song_artist)
             print(f"[process_song] lyrics source: {lyrics_source}")
 
-        stage("pitch", 0.70, "quantizing notes per word")
+        stage("pitch", 0.70, "matching notes to words")
         notes = quantize_notes(pitch, words)
         print(f"[process_song] notes={len(notes)}")
 
@@ -526,7 +526,7 @@ def process_song(
         # re-cut phrases or run a server-side pitch comparison without
         # paying for Demucs/Whisper/Crepe again. Foundation for harmony
         # tracks, retroactive phrase-boundary fixes, etc.
-        stage("slicing", 0.85, "persisting derived artifacts")
+        stage("slicing", 0.85, "saving analysis")
         try:
             import io as _io
             import numpy as _np
@@ -572,7 +572,7 @@ def process_song(
             print(f"[process_song] derived persist failed: {e}")
         heartbeat()
 
-        stage("slicing", 0.90, f"slicing + uploading {len(phrases)} clips")
+        stage("slicing", 0.90, f"preparing {len(phrases)} phrases")
         slices_dir = tmp_dir / "slices"
         slices_dir.mkdir()
         owner = user_id or "smoke"
@@ -603,7 +603,7 @@ def process_song(
             results = list(ex.map(_slice_and_upload_one, enumerate(phrases)))
 
         if user_id:
-            stage("slicing", 0.95, "inserting phrase rows + marking song ready")
+            stage("slicing", 0.95, "finishing up")
             rows = [{
                 "song_id": song_id,
                 "user_id": user_id,
