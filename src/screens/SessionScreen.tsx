@@ -15,6 +15,7 @@ import { startCountIn, type CountInHandle } from '../lib/countInClicks';
 import { getAudioContext } from '../lib/audioService';
 import type { PitchAnalysis } from '../lib/pitch';
 import { useBackingVolume, nextStep } from '../lib/backingVolume';
+import { useAnalysisEnabled } from '../lib/analysisEnabled';
 import {
   useSyncOffset,
   SYNC_OFFSET_STEP_MS,
@@ -116,6 +117,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   const [backingEnabled, setBackingEnabled] = useState(true);
   const [backingVolume, setBackingVolume] = useBackingVolume();
   const [syncOffsetMs, setSyncOffsetMs] = useSyncOffset();
+  const [analysisEnabled, setAnalysisEnabled] = useAnalysisEnabled();
   // Toggle for the user's own recorded take during done-view playback.
   // Default on — the whole point of done view is hearing yourself.
   const [yourTakeEnabled, setYourTakeEnabled] = useState(true);
@@ -363,21 +365,22 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, [leadVocalEnabled]);
   // Your-take gain: ramped on the recording's GainNode in the same
   // 30ms window phraseLoop uses, so the toggle feels consistent.
-  // ALSO gated on `analysis !== null`: keep the take silent until
-  // pitch analysis lands with detected_offset_ms, so the user
-  // doesn't hear the recording at the wrong sync (which sounds
-  // broken). Once analysis returns, the rebuild-on-analysis effect
-  // re-anchors the buffer; this gain effect simultaneously unmutes.
+  // When analysis is enabled we also gate on `analysis !== null` —
+  // keep the take silent until pitch analysis lands with
+  // detected_offset_ms so the user doesn't hear the recording at the
+  // wrong sync. When analysis is off, we play immediately at the
+  // fallback offset (no scoring, but no waiting either).
   useEffect(() => {
     const gain = recordingGainRef.current;
     const ctx = getAudioContext();
     if (!gain || !ctx) return;
     const t = ctx.currentTime;
-    const target = yourTakeEnabled && analysis !== null ? 1.0 : 0;
+    const waitingForAnalysis = analysisEnabled && analysis === null;
+    const target = yourTakeEnabled && !waitingForAnalysis ? 1.0 : 0;
     gain.gain.cancelScheduledValues(t);
     gain.gain.setValueAtTime(gain.gain.value, t);
     gain.gain.linearRampToValueAtTime(target, t + 0.03);
-  }, [yourTakeEnabled, analysis]);
+  }, [yourTakeEnabled, analysis, analysisEnabled]);
 
   // Rebuild on either the manual sync nudge OR the auto-detected
   // offset arriving (analysis is async — completes a few seconds
@@ -508,11 +511,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       source.buffer = aligned;
       source.loop = true;
       const gain = ctx.createGain();
-      // Start muted — the gain useEffect will ramp up once pitch
-      // analysis arrives with detected_offset_ms. Avoids playing the
-      // un-synced take audibly during the few seconds analysis is
-      // running.
-      gain.gain.value = 0;
+      // When analysis is enabled we start muted and let the gain
+      // useEffect ramp up once analysis arrives with the detected
+      // offset. When analysis is OFF, we never wait — start at full
+      // immediately (using the fallback offset).
+      gain.gain.value = analysisEnabled
+        ? 0
+        : (settingsRef.current.yourTakeEnabled ? 1.0 : 0);
       source.connect(gain).connect(ctx.destination);
       source.start(commonStartAt);
       recordingSourceRef.current = source;
@@ -528,7 +533,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       playbackRef.current = sound;
       sound.playAsync().catch(() => {});
     }
-  }, [phrase, stopRecordingSource]);
+  }, [phrase, stopRecordingSource, analysisEnabled]);
 
   const stopRecording = useCallback(async () => {
     const recorder = recorderRef.current;
@@ -562,23 +567,30 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     try {
       const { attemptId } = await uploadAndInsert(phrase, uri);
 
-      setAnalysisPending(true);
-      runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
-        setAnalysis(a);
-        setAnalysisPending(false);
-        if (a) {
-          setFeedbackPending(true);
-          requestFeedback(attemptId, feedbackInlineFor(phrase, a))
-            .then(setFeedback)
-            .catch((e) => console.warn('feedback request failed:', e))
-            .finally(() => setFeedbackPending(false));
-        }
-      });
+      // Pitch analysis is opt-in — when the Analysis toggle is off
+      // we skip the YIN curve, sync detection, and Claude feedback.
+      // The take is still saved, just unscored. Snapshot the toggle
+      // here so a later flip doesn't mid-flight kick us into a half
+      // analysis path.
+      if (analysisEnabled) {
+        setAnalysisPending(true);
+        runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
+          setAnalysis(a);
+          setAnalysisPending(false);
+          if (a) {
+            setFeedbackPending(true);
+            requestFeedback(attemptId, feedbackInlineFor(phrase, a))
+              .then(setFeedback)
+              .catch((e) => console.warn('feedback request failed:', e))
+              .finally(() => setFeedbackPending(false));
+          }
+        });
+      }
     } catch (e: unknown) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setStage('error');
     }
-  }, [phrase, startDonePlayback]);
+  }, [phrase, startDonePlayback, analysisEnabled]);
 
   const startRecording = useCallback(async () => {
     if (!recorderRef.current) {
@@ -736,12 +748,20 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         {(stage === 'playing' || stage === 'recording') && (
           <View style={styles.liveControls}>
             {stage === 'playing' && (
-              <RetroButton
-                label="● Record"
-                onPress={startRecording}
-                variant="danger"
-                size="lg"
-              />
+              <View style={styles.recordRow}>
+                <RetroButton
+                  label={analysisEnabled ? 'Analysis: ON' : 'Analysis: OFF'}
+                  onPress={() => setAnalysisEnabled(!analysisEnabled)}
+                  size="md"
+                  variant={analysisEnabled ? 'dark' : 'light'}
+                />
+                <RetroButton
+                  label="● Record"
+                  onPress={startRecording}
+                  variant="danger"
+                  size="lg"
+                />
+              </View>
             )}
             {stage === 'recording' && (
               <RetroButton
@@ -1127,6 +1147,11 @@ const styles = StyleSheet.create({
   liveControls: {
     alignItems: 'center',
     gap: 10,
+  },
+  recordRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
   countdownNum: {
     fontFamily: FONTS.pixel,

@@ -15,6 +15,7 @@ export type PhraseLoopHandle = {
   setBackingEnabled: (enabled: boolean) => void;
   setBackingVolume: (volume: number) => void;
   setVocalsEnabled: (enabled: boolean) => void;
+  setVocalsVolume: (volume: number) => void;
   /** Schedule a callback at the start of the next loop iteration.
    *  Returns a cancel fn. Used to arm recording at a clean t=0 anchor. */
   onNextLoopStart: (cb: () => void) => () => void;
@@ -108,7 +109,7 @@ export async function startPhraseLoop(
   let backingVolume = opts.backingVolume ?? 0.7;
   let backingEnabled = opts.backingEnabled ?? true;
   let vocalsEnabled = opts.vocalsEnabled ?? true;
-  const vocalsVolume = opts.vocalsVolume ?? 0.85;
+  let vocalsVolume = opts.vocalsVolume ?? 0.85;
 
   // Gain nodes live outside the source so seek() can recreate the
   // sources without touching the gain — toggle state survives a seek.
@@ -246,6 +247,10 @@ export async function startPhraseLoop(
     setVocalsEnabled(enabled) {
       vocalsEnabled = enabled;
       if (vocalsGain) ramp(vocalsGain, enabled ? vocalsVolume : 0);
+    },
+    setVocalsVolume(volume) {
+      vocalsVolume = Math.max(0, Math.min(1, volume));
+      if (vocalsGain && vocalsEnabled) ramp(vocalsGain, vocalsVolume);
     },
     seek(positionMs) {
       const positionSec = Math.max(

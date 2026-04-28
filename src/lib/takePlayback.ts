@@ -10,8 +10,11 @@ import { startPhraseLoop } from './phraseLoop';
 export type TakePlaybackHandle = {
   stop: () => void;
   setBackingEnabled: (enabled: boolean) => void;
+  setBackingVolume: (volume: number) => void;
   setVocalsEnabled: (enabled: boolean) => void;
+  setVocalsVolume: (volume: number) => void;
   setTakeEnabled: (enabled: boolean) => void;
+  setTakeVolume: (volume: number) => void;
   /** Seek to a position within the loop. All three sources jump in
    *  lockstep so backing/vocals/your take stay sample-aligned. */
   seek: (positionMs: number) => void;
@@ -36,6 +39,8 @@ export type TakePlaybackOptions = {
   vocalsEnabled?: boolean;
   takeEnabled?: boolean;
   backingVolume?: number;
+  vocalsVolume?: number;
+  takeVolume?: number;
   songId?: string;
   phraseId?: string;
   /** Total shift applied to the take in ms. Caller computes — typical
@@ -83,6 +88,7 @@ export async function startTakePlayback(
     backingEnabled: opts.backingEnabled ?? true,
     backingVolume: opts.backingVolume ?? 0.7,
     vocalsEnabled: opts.vocalsEnabled ?? true,
+    vocalsVolume: opts.vocalsVolume ?? 0.85,
     startAt: commonStartAt,
   });
   if (!phraseHandle) return null;
@@ -141,9 +147,11 @@ export async function startTakePlayback(
   // Take's gain lives outside the source — survives seek so toggle
   // state doesn't reset when the user drags the scrubber.
   let takeGain: GainNode | null = null;
+  let currentTakeVolume = Math.max(0, Math.min(1, opts.takeVolume ?? 1.0));
+  let currentTakeEnabled = opts.takeEnabled !== false;
   if (alignedRecording) {
     takeGain = ctx.createGain();
-    takeGain.gain.value = opts.takeEnabled !== false ? 1.0 : 0;
+    takeGain.gain.value = currentTakeEnabled ? currentTakeVolume : 0;
     takeGain.connect(ctx.destination);
   }
 
@@ -189,9 +197,16 @@ export async function startTakePlayback(
       }
     },
     setBackingEnabled: (b) => phraseHandle.setBackingEnabled(b),
+    setBackingVolume: (v) => phraseHandle.setBackingVolume(v),
     setVocalsEnabled: (b) => phraseHandle.setVocalsEnabled(b),
+    setVocalsVolume: (v) => phraseHandle.setVocalsVolume(v),
     setTakeEnabled: (b) => {
-      if (takeGain) ramp(takeGain, b ? 1.0 : 0);
+      currentTakeEnabled = b;
+      if (takeGain) ramp(takeGain, b ? currentTakeVolume : 0);
+    },
+    setTakeVolume: (v) => {
+      currentTakeVolume = Math.max(0, Math.min(1, v));
+      if (takeGain && currentTakeEnabled) ramp(takeGain, currentTakeVolume);
     },
     seek(positionMs) {
       if (stopped) return;

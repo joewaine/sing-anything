@@ -139,9 +139,6 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
           <Text style={styles.title}>Your library</Text>
           <View style={styles.headerActions}>
             {onSignOut && <RetroButton label="Sign out" onPress={onSignOut} size="sm" />}
-            {onCalibrate && (
-              <RetroButton label="Audio sync" onPress={onCalibrate} size="sm" />
-            )}
             {onYourTakes && (
               <RetroButton label="Your takes" onPress={onYourTakes} size="sm" />
             )}

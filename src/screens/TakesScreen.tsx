@@ -17,6 +17,7 @@ import {
   type TakeRow,
 } from '../lib/attempts';
 import { startTakePlayback, type TakePlaybackHandle } from '../lib/takePlayback';
+import { useMixVolumes, type MixVolumes } from '../lib/mixVolumes';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
 
 type Props = {
@@ -31,6 +32,7 @@ export default function TakesScreen({ onBack }: Props) {
     null,
   );
   const handleRef = useRef<TakePlaybackHandle | null>(null);
+  const [mix, setMixKey] = useMixVolumes();
   // Generation counter for in-flight playTake calls. Each click bumps
   // the gen; if the awaits resolve under a stale gen the handle is
   // discarded. Without this, double-clicking Play (or quick switches
@@ -96,6 +98,10 @@ export default function TakesScreen({ onBack }: Props) {
           // about hearing yourself against the music, not against the
           // reference vocal. User can flip it on via the toggle.
           vocalsEnabled: false,
+          // Apply persisted per-source volumes to the initial mix.
+          backingVolume: mix.backing,
+          vocalsVolume: mix.vocals,
+          takeVolume: mix.take,
         });
         if (myGen !== playGenRef.current) {
           // Superseded by a later play / stop — discard this handle so
@@ -114,7 +120,7 @@ export default function TakesScreen({ onBack }: Props) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [stopActive, offsetForTake],
+    [stopActive, offsetForTake, mix.backing, mix.vocals, mix.take],
   );
 
   const removeTake = useCallback(
@@ -189,6 +195,8 @@ export default function TakesScreen({ onBack }: Props) {
                 onPlay={() => playTake(item)}
                 onStop={stopActive}
                 onDelete={() => removeTake(item)}
+                mix={mix}
+                onChangeMix={setMixKey}
               />
             )}
           />
@@ -205,6 +213,8 @@ function TakeRowView({
   onPlay,
   onStop,
   onDelete,
+  mix,
+  onChangeMix,
 }: {
   take: TakeRow;
   isActive: boolean;
@@ -212,6 +222,8 @@ function TakeRowView({
   onPlay: () => void;
   onStop: () => void;
   onDelete: () => void;
+  mix: MixVolumes;
+  onChangeMix: (key: keyof MixVolumes, value: number) => void;
 }) {
   // Toggle states are local to a row that's actively playing — they
   // stay in sync with the live handle's gains via the setter calls.
@@ -245,6 +257,18 @@ function TakeRowView({
   useEffect(() => {
     handle?.setTakeEnabled(take_);
   }, [take_, handle]);
+  // Per-source volume — live updates to the playing handle as the
+  // user drags a slider. The mix object itself is persisted by the
+  // useMixVolumes hook in the parent.
+  useEffect(() => {
+    handle?.setBackingVolume(mix.backing);
+  }, [mix.backing, handle]);
+  useEffect(() => {
+    handle?.setVocalsVolume(mix.vocals);
+  }, [mix.vocals, handle]);
+  useEffect(() => {
+    handle?.setTakeVolume(mix.take);
+  }, [mix.take, handle]);
 
   // Poll handle.getPositionMs at ~10Hz while active. Cheaper than
   // a 60Hz callback and the slider's eye doesn't notice the seam.
@@ -320,21 +344,27 @@ function TakeRowView({
               handle?.seek(ms);
             }}
           />
-          <View style={styles.toggleRow}>
-            <ToggleChip
+          <View style={styles.mixStack}>
+            <MixRow
               label="Backing"
               enabled={backing}
               onToggle={() => setBacking((v) => !v)}
+              volume={mix.backing}
+              onChangeVolume={(v) => onChangeMix('backing', v)}
             />
-            <ToggleChip
+            <MixRow
               label="Lead vocal"
               enabled={vocals}
               onToggle={() => setVocals((v) => !v)}
+              volume={mix.vocals}
+              onChangeVolume={(v) => onChangeMix('vocals', v)}
             />
-            <ToggleChip
+            <MixRow
               label="Your take"
               enabled={take_}
               onToggle={() => setTake((v) => !v)}
+              volume={mix.take}
+              onChangeVolume={(v) => onChangeMix('take', v)}
             />
           </View>
         </>
@@ -390,6 +420,51 @@ function Scrubber({
       <Text style={styles.scrubberTime}>{fmt(positionMs)}</Text>
       <View style={styles.scrubberFlex}>{inputEl}</View>
       <Text style={styles.scrubberTime}>{fmt(durationMs)}</Text>
+    </View>
+  );
+}
+
+function MixRow({
+  label,
+  enabled,
+  onToggle,
+  volume,
+  onChangeVolume,
+}: {
+  label: string;
+  enabled: boolean;
+  onToggle: () => void;
+  volume: number;
+  onChangeVolume: (v: number) => void;
+}) {
+  const pct = Math.round(volume * 100);
+  // Web range input — same approach as the scrubber. Native would
+  // need a slider package; for now this row just renders the toggle
+  // chip and percent without a slider on native.
+  const slider =
+    Platform.OS === 'web'
+      ? createElement('input', {
+          type: 'range',
+          min: 0,
+          max: 100,
+          step: 1,
+          value: pct,
+          onChange: (e: any) =>
+            onChangeVolume(Number(e.target.value) / 100),
+          style: {
+            width: '100%',
+            accentColor: '#000',
+            cursor: 'pointer',
+          },
+        })
+      : null;
+  return (
+    <View style={styles.mixRow}>
+      <View style={styles.mixChipWrap}>
+        <ToggleChip label={label} enabled={enabled} onToggle={onToggle} />
+      </View>
+      <View style={styles.mixSliderWrap}>{slider}</View>
+      <Text style={styles.mixPct}>{pct}%</Text>
     </View>
   );
 }
@@ -496,6 +571,29 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
+  },
+  mixStack: {
+    flexDirection: 'column',
+    gap: 6,
+    marginTop: 4,
+  },
+  mixRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  mixChipWrap: {
+    width: 110,
+  },
+  mixSliderWrap: {
+    flex: 1,
+  },
+  mixPct: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.black,
+    minWidth: 36,
+    textAlign: 'right',
   },
   scrubberRow: {
     flexDirection: 'row',
