@@ -163,6 +163,27 @@ def _yt_download(url: str, dest: Path) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        # Player client fallback chain. YouTube serves different
+        # endpoints to different clients; the default `web` is the most
+        # bot-checked. android / ios / mweb are sometimes happy to give
+        # us streams when web fails. yt-dlp walks the list in order and
+        # uses whichever responds with the manifest. Also forces it to
+        # NOT use `web_creator` etc that often trigger bot challenges.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            },
+        },
+        # Real-looking user agent — yt-dlp's default UA is recognisable
+        # and gets flagged faster than a stock browser string.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     # YouTube only: route through IPRoyal residential proxy (env var
     # PROXY_URL injected via the `iproyal` Modal secret). Modal's
@@ -195,8 +216,13 @@ def _yt_download(url: str, dest: Path) -> dict:
             opts["retries"] = 8
             opts["fragment_retries"] = 8
             opts["socket_timeout"] = 30
-            print("[_yt_download] routing YouTube via residential proxy "
-                  "(session rotated)")
+            # Log first 6 chars of the rotated session token so we can
+            # confirm rotation is firing distinct values across calls.
+            import re as _re
+            m = _re.search(r"session-([A-Za-z0-9]+)", proxy_url)
+            tag = m.group(1)[:6] if m else "?"
+            print(f"[_yt_download] routing YouTube via residential proxy "
+                  f"(session={tag}…)")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
