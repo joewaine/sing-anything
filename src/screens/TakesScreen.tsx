@@ -33,6 +33,11 @@ export default function TakesScreen({ onBack }: Props) {
   );
   const handleRef = useRef<TakePlaybackHandle | null>(null);
   const [syncOffset, setSyncOffset] = useSyncOffset();
+  // Generation counter for in-flight playTake calls. Each click bumps
+  // the gen; if the awaits resolve under a stale gen the handle is
+  // discarded. Without this, double-clicking Play (or quick switches
+  // between rows) could leak two handles and play two tracks at once.
+  const playGenRef = useRef(0);
 
   // Apply latest sync nudge to the active handle without restarting.
   useEffect(() => {
@@ -60,6 +65,9 @@ export default function TakesScreen({ onBack }: Props) {
   }, []);
 
   const stopActive = useCallback(() => {
+    // Bumping the generation invalidates any in-flight playTake call so
+    // a late-resolving await won't stash a handle on a torn-down screen.
+    playGenRef.current += 1;
     handleRef.current?.stop();
     handleRef.current = null;
     setActiveHandle(null);
@@ -69,8 +77,10 @@ export default function TakesScreen({ onBack }: Props) {
   const playTake = useCallback(
     async (take: TakeRow) => {
       stopActive();
+      const myGen = ++playGenRef.current;
       try {
         const { recordingUrl, vocalsUrl, backingUrl } = await signTakeUrls(take);
+        if (myGen !== playGenRef.current) return;
         const handle = await startTakePlayback({
           recordingUrl,
           vocalsUrl,
@@ -80,6 +90,12 @@ export default function TakesScreen({ onBack }: Props) {
           phraseId: take.phrase.id,
           extraOffsetMs: syncOffset,
         });
+        if (myGen !== playGenRef.current) {
+          // Superseded by a later play / stop — discard this handle so
+          // it doesn't keep playing in the background.
+          handle?.stop();
+          return;
+        }
         if (!handle) {
           setError('Audio not available on this device');
           return;
@@ -91,8 +107,27 @@ export default function TakesScreen({ onBack }: Props) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [stopActive],
+    [stopActive, syncOffset],
   );
+
+  // Stop active playback when the tab is hidden (user switches tabs,
+  // minimizes, or closes). pagehide also covers cases where the tab is
+  // discarded without firing visibilitychange first.
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const onVisible = () => {
+      if (document.visibilityState === 'hidden') {
+        stopActive();
+      }
+    };
+    const onPageHide = () => stopActive();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [stopActive]);
 
   return (
     <Chrome>

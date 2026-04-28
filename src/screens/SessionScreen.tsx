@@ -124,6 +124,12 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   // a race between stopRecording's async startDonePlayback and a
   // back-navigation left the loop + sound running on a dead screen.
   const unmountedRef = useRef(false);
+  // Generation counter for in-flight phraseLoop / done-playback calls.
+  // Each call bumps the gen; if a later call (or a teardown) bumps it
+  // again, the in-flight handle is discarded on resolve. Closes the
+  // race that left two loops playing on top of each other when the
+  // user moved between stages quickly.
+  const phraseGenRef = useRef(0);
   const [countdown, setCountdown] = useState(0);
 
   const revokeLastRecording = useCallback(() => {
@@ -163,6 +169,9 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   }, []);
 
   const teardown = useCallback(() => {
+    // Bump generation so any in-flight async loop creation discards
+    // its result on resolve.
+    phraseGenRef.current += 1;
     countInRef.current?.stop();
     countInRef.current = null;
     phraseLoopRef.current?.stop();
@@ -203,6 +212,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   ]);
 
   const startLoopFromZero = useCallback(async () => {
+    const myGen = ++phraseGenRef.current;
     phraseLoopRef.current?.stop();
     phraseLoopRef.current = null;
     const s = settingsRef.current;
@@ -223,7 +233,9 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         currentMsRef.current = ms;
       },
     });
-    if (unmountedRef.current) {
+    if (unmountedRef.current || myGen !== phraseGenRef.current) {
+      // Superseded by a later call (or a teardown) — dispose this
+      // handle so it doesn't keep playing in the background.
       handle?.stop();
       return null;
     }
@@ -254,6 +266,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       // Permission not granted yet — recorder.prepare() will surface
       // a friendly error if Record is pressed before access is allowed.
     });
+    // Defensive: stop any prior count-in / loop before spawning new
+    // ones. Caller is meant to teardown first, but if a stray click
+    // re-entered startInitialLoop we don't want overlapping runs.
+    countInRef.current?.stop();
+    countInRef.current = null;
+    phraseLoopRef.current?.stop();
+    phraseLoopRef.current = null;
     // Count-in on first arrival too, not just when Record is pressed.
     // The user wants a moment to settle into the tempo before the
     // phrase begins playing.
@@ -284,6 +303,33 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phrase.id]);
+
+  // Stop everything when the user clicks out of the tab / closes the
+  // window. Web Audio doesn't auto-pause on background, so without
+  // this the loop + recording sources keep playing on a hidden tab.
+  // pagehide covers the tab-discard case where visibilitychange
+  // sometimes doesn't fire.
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const onVisible = () => {
+      if (document.visibilityState === 'hidden') {
+        teardown();
+        playbackRef.current?.unloadAsync().catch(() => {});
+        playbackRef.current = null;
+      }
+    };
+    const onPageHide = () => {
+      teardown();
+      playbackRef.current?.unloadAsync().catch(() => {});
+      playbackRef.current = null;
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [teardown]);
 
   // Toggles + volume slider — apply to the live loop handle without
   // re-scheduling. Each ramps the relevant gain in ~30ms.
@@ -353,6 +399,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
   // ran on a separate clock from the Web Audio backing and drifted by
   // the duration of the createAsync await (50–500ms).
   const startDonePlayback = useCallback(async () => {
+    const myGen = ++phraseGenRef.current;
     playbackRef.current?.unloadAsync().catch(() => {});
     playbackRef.current = null;
     stopRecordingSource();
@@ -377,7 +424,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         console.warn('[done] recording decode failed:', e);
       }
     }
-    if (unmountedRef.current) return;
+    if (unmountedRef.current || myGen !== phraseGenRef.current) return;
 
     // Common future timestamp for everything that follows. 0.1s gives
     // startPhraseLoop (which itself awaits a buffer cache lookup) and
@@ -400,7 +447,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
         currentMsRef.current = ms;
       },
     });
-    if (unmountedRef.current) {
+    if (unmountedRef.current || myGen !== phraseGenRef.current) {
       handle?.stop();
       return;
     }
@@ -436,7 +483,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       // Native fallback: expo-av Audio.Sound. Drifts vs backing,
       // but native doesn't share the Web Audio clock anyway.
       const { sound } = await Audio.Sound.createAsync({ uri });
-      if (unmountedRef.current) {
+      if (unmountedRef.current || myGen !== phraseGenRef.current) {
         sound.unloadAsync().catch(() => {});
         return;
       }
@@ -565,13 +612,19 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     setAnalysisPending(false);
     setFeedback(null);
     setFeedbackPending(false);
+    // Done-view spawns a backing loop + recording source that aren't
+    // touched by startInitialLoop's count-in. Without this teardown
+    // the previous take's audio kept playing UNDER the new count-in,
+    // causing audible double-playback. teardown also bumps the
+    // generation so any in-flight async paths discard themselves.
+    teardown();
     playbackRef.current?.unloadAsync().catch(() => {});
     playbackRef.current = null;
     revokeLastRecording();
     currentMsRef.current = 0;
     setStage('loading');
     await startInitialLoop();
-  }, [revokeLastRecording, startInitialLoop]);
+  }, [revokeLastRecording, startInitialLoop, teardown]);
 
   const loopRunning = stage === 'playing' || stage === 'recording';
   const showRibbon =
