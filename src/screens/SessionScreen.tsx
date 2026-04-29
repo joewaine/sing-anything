@@ -215,6 +215,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     leadVocalEnabled,
     yourTakeEnabled,
     syncOffsetMs,
+    analysisPending,
   });
   useEffect(() => {
     settingsRef.current = {
@@ -223,6 +224,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       leadVocalEnabled,
       yourTakeEnabled,
       syncOffsetMs,
+      analysisPending,
     };
   }, [
     backingEnabled,
@@ -230,6 +232,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     leadVocalEnabled,
     yourTakeEnabled,
     syncOffsetMs,
+    analysisPending,
   ]);
 
   const startLoopFromZero = useCallback(async () => {
@@ -364,23 +367,23 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     phraseLoopRef.current?.setVocalsEnabled(leadVocalEnabled);
   }, [leadVocalEnabled]);
   // Your-take gain: ramped on the recording's GainNode in the same
-  // 30ms window phraseLoop uses, so the toggle feels consistent.
-  // When analysis is enabled we also gate on `analysis !== null` —
-  // keep the take silent until pitch analysis lands with
-  // detected_offset_ms so the user doesn't hear the recording at the
-  // wrong sync. When analysis is off, we play immediately at the
-  // fallback offset (no scoring, but no waiting either).
+  // 30ms window phraseLoop uses, so the toggle feels consistent. The
+  // take stays muted while pitch analysis is in flight — the user
+  // shouldn't hear themselves at the wrong sync. Once analysisPending
+  // flips false (success OR failure), we have whatever offset we're
+  // going to get and can ramp the take up. This gate is independent
+  // of the Analysis toggle: pitch analysis always runs to compute
+  // detected_offset_ms; the toggle only controls the visible score.
   useEffect(() => {
     const gain = recordingGainRef.current;
     const ctx = getAudioContext();
     if (!gain || !ctx) return;
     const t = ctx.currentTime;
-    const waitingForAnalysis = analysisEnabled && analysis === null;
-    const target = yourTakeEnabled && !waitingForAnalysis ? 1.0 : 0;
+    const target = yourTakeEnabled && !analysisPending ? 1.0 : 0;
     gain.gain.cancelScheduledValues(t);
     gain.gain.setValueAtTime(gain.gain.value, t);
     gain.gain.linearRampToValueAtTime(target, t + 0.03);
-  }, [yourTakeEnabled, analysis, analysisEnabled]);
+  }, [yourTakeEnabled, analysisPending]);
 
   // Rebuild on either the manual sync nudge OR the auto-detected
   // offset arriving (analysis is async — completes a few seconds
@@ -511,13 +514,17 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       source.buffer = aligned;
       source.loop = true;
       const gain = ctx.createGain();
-      // When analysis is enabled we start muted and let the gain
-      // useEffect ramp up once analysis arrives with the detected
-      // offset. When analysis is OFF, we never wait — start at full
-      // immediately (using the fallback offset).
-      gain.gain.value = analysisEnabled
-        ? 0
-        : (settingsRef.current.yourTakeEnabled ? 1.0 : 0);
+      // Start muted while pitch analysis is still pending — we don't
+      // want the user hearing themselves at the wrong sync. Once
+      // analysis settles, the gain useEffect ramps up. On Replay
+      // (analysis already done), pending is false and we start at
+      // full immediately since the useEffect won't re-fire (deps
+      // unchanged between Replay press and gain-node creation). Read
+      // the freshest settingsRef.current here, not `s` from above —
+      // it may have been replaced during the awaits.
+      const fresh = settingsRef.current;
+      gain.gain.value =
+        fresh.yourTakeEnabled && !fresh.analysisPending ? 1.0 : 0;
       source.connect(gain).connect(ctx.destination);
       source.start(commonStartAt);
       recordingSourceRef.current = source;
@@ -533,7 +540,7 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       playbackRef.current = sound;
       sound.playAsync().catch(() => {});
     }
-  }, [phrase, stopRecordingSource, analysisEnabled]);
+  }, [phrase, stopRecordingSource]);
 
   const stopRecording = useCallback(async () => {
     const recorder = recorderRef.current;
@@ -562,6 +569,13 @@ export default function SessionScreen({ phrase, onBack }: Props) {
     currentMsRef.current = phrase.duration_ms;
 
     setStage('done');
+    // Mark analysis as pending BEFORE startDonePlayback so the gain
+    // gating useEffect sees a consistent "wait for sync" state from
+    // the moment the take's gain node exists. Without this, there's
+    // a race where the gain node is created before analysisPending
+    // flips true, leaving the take audible at the wrong offset for
+    // a beat.
+    setAnalysisPending(true);
     void startDonePlayback();
 
     try {
@@ -573,7 +587,6 @@ export default function SessionScreen({ phrase, onBack }: Props) {
       // only gates whether we show the score / hit rate in the done
       // view + whether we request the Claude coach feedback (which
       // is the only thing that costs real money).
-      setAnalysisPending(true);
       runAnalysisAndSave(attemptId, phrase.notes, uri).then((a) => {
         setAnalysis(a);
         setAnalysisPending(false);

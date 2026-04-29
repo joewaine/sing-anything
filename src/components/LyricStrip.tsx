@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, View, type LayoutChangeEvent } from 'react-native';
 import { makeActiveNoteCursor } from '../lib/activeNoteCursor';
 import type { MidiNote } from '../types';
 import { BORDER_1BIT, COLORS, FONTS, SHADOW_1BIT } from '../theme';
@@ -13,16 +13,22 @@ type Props = {
 };
 
 // Minimum gap between consecutive notes (end of one to start of next)
-// before we insert a line break. ~600ms is a comfortable breath; tight
-// phrases stay on one line, while clearly-separated thoughts wrap.
-const LINE_BREAK_GAP_MS = 600;
-// Lyric box shows at most VISIBLE_LINES rows; the rest is clipped via
-// overflow:hidden and a translateY transform that scrolls the viewport
-// so the active line stays near the top. 3 lines = past + active +
-// upcoming, with the active line biased to row 1 (middle) so the next
-// line is always in view.
-const VISIBLE_LINES = 3;
+// before we insert a line break. Shorter than the original 600ms so
+// long phrases break into more, shorter lines — combined with text
+// wrapping (no numberOfLines clip), this prevents words from dropping
+// off the right edge.
+const LINE_BREAK_GAP_MS = 350;
+// Lyric box shows at most VISIBLE_LINES rows of viewport. With wrapping
+// allowed, a single logical line may span multiple visual rows; the
+// translateY math below uses MEASURED line heights (onLayout) so the
+// active line stays correctly positioned even when earlier lines wrap.
+const VISIBLE_LINES = 6;
 const LINE_HEIGHT = 22;
+// How many lines of past context to keep above the active line. With a
+// 6-line viewport, holding 2 lines of past + the active line + 3 lines
+// of upcoming context puts the active line a third of the way down —
+// enough room to read ahead without losing what just happened.
+const PAST_CONTEXT_LINES = 2;
 
 /**
  * Renders the phrase lyric as individual syllables; when `active`, runs its own
@@ -129,15 +135,48 @@ export default function LyricStrip({
     setActiveLineIdx(0);
   }, [lines]);
 
-  // Active stays at row 1 (middle) of the 3-line viewport whenever
-  // possible — one past line, active, one upcoming. At the very start
-  // (activeLineIdx 0) row 0 is shown with no past context; at the
-  // very end the bottom of the lyric anchors the window.
-  const maxStart = Math.max(0, lines.length - VISIBLE_LINES);
-  const startLine = Math.max(0, Math.min(maxStart, activeLineIdx - 1));
-  const translateY = -startLine * LINE_HEIGHT;
-  const visibleHeight =
-    Math.min(VISIBLE_LINES, lines.length) * LINE_HEIGHT;
+  // Measured per-line heights. A line that wraps to N visual rows
+  // measures as N × lineHeight; an empty/single-row line measures as
+  // ~LINE_HEIGHT. We use the measured values to scroll by exactly the
+  // right amount — without measurement, a wrapped line above the
+  // active line would offset it visually since translateY assumed
+  // every line was one row tall.
+  const [lineHeights, setLineHeights] = useState<number[]>([]);
+  useEffect(() => {
+    // Reset measurements when the line set changes — old indexes no
+    // longer correspond to the same lyric content.
+    setLineHeights([]);
+  }, [lines]);
+
+  const onLineLayout = (lineIdx: number) => (e: LayoutChangeEvent) => {
+    const h = e.nativeEvent.layout.height;
+    setLineHeights((prev) => {
+      if (prev[lineIdx] === h) return prev;
+      const next = prev.slice();
+      next[lineIdx] = h;
+      return next;
+    });
+  };
+
+  // Bias the active line a third of the way down the viewport so the
+  // user always has 2 lines of past context plus 3 lines of read-ahead.
+  // Clamp so we never scroll past the end of the lyrics.
+  const startLine = Math.max(
+    0,
+    Math.min(
+      Math.max(0, lines.length - VISIBLE_LINES),
+      activeLineIdx - PAST_CONTEXT_LINES,
+    ),
+  );
+  // Sum measured heights up to startLine; fall back to LINE_HEIGHT for
+  // any line we haven't measured yet (first frame after a re-mount).
+  let translateY = 0;
+  for (let i = 0; i < startLine; i++) {
+    translateY -= lineHeights[i] ?? LINE_HEIGHT;
+  }
+  // Fixed viewport height — predictable layout regardless of how many
+  // lines wrap. 6 × LINE_HEIGHT gives generous breathing room.
+  const visibleHeight = VISIBLE_LINES * LINE_HEIGHT;
 
   return (
     <View style={styles.strip}>
@@ -146,9 +185,8 @@ export default function LyricStrip({
           style={[
             styles.inner,
             // Inline transition so RN web doesn't strip it. translateY
-            // updates step by 1 line at a time as activeLineIdx
-            // advances; the CSS transition makes the scroll smooth
-            // instead of jumping.
+            // updates as activeLineIdx advances OR as line heights are
+            // re-measured; the CSS transition keeps the scroll smooth.
             {
               transform: [{ translateY }],
               transitionProperty: 'transform',
@@ -161,7 +199,11 @@ export default function LyricStrip({
           ]}
         >
           {lines.map((line, lineIdx) => (
-            <Text key={lineIdx} style={styles.line} numberOfLines={1}>
+            <Text
+              key={lineIdx}
+              style={styles.line}
+              onLayout={onLineLayout(lineIdx)}
+            >
               {line.items.map((x, i) => {
                 const isActive = x.idx === activeIdx;
                 return (

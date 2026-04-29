@@ -95,6 +95,11 @@ export default function PitchRibbon({
 
   const scrollerRef = useRef<View>(null);
   const cursorRef = useRef<View>(null);
+  // Pulsing "playing" indicator. Animated imperatively from the rAF
+  // tick (same pattern as the cursor/scroller transforms) so we get
+  // continuous motion even during long instrumental gaps where no
+  // notes are entering or leaving the playhead band.
+  const pulseRef = useRef<View>(null);
 
   const useMarquee = durationMs > MARQUEE_THRESHOLD_MS;
 
@@ -162,6 +167,16 @@ export default function PitchRibbon({
         if (el) el.style.transform = `translateX(${x}px)`;
       }
 
+      // Heartbeat pulse: opacity oscillates 0.2 ↔ 1.0 over 800ms via a
+      // raised-cosine. Driven by performance.now (not playback ms) so
+      // the pulse keeps blinking even if currentMsRef is paused.
+      const pulseEl = pulseRef.current as unknown as HTMLElement | null;
+      if (pulseEl) {
+        const phase = (performance.now() % 800) / 800;
+        const o = 0.2 + 0.8 * (0.5 - 0.5 * Math.cos(phase * 2 * Math.PI));
+        pulseEl.style.opacity = String(o);
+      }
+
       const idx = cursor(ms);
       if (idx !== activeIdxRef.current) {
         activeIdxRef.current = idx;
@@ -221,6 +236,14 @@ export default function PitchRibbon({
           <View style={styles.cursorLine} />
           <View style={styles.cursorArrowBottom} />
         </View>
+      )}
+
+      {active && (
+        <View
+          ref={pulseRef}
+          pointerEvents="none"
+          style={styles.pulseDot}
+        />
       )}
     </View>
   );
@@ -356,5 +379,14 @@ const styles = StyleSheet.create({
     borderRightColor: 'transparent',
     borderBottomWidth: 7,
     borderBottomColor: COLORS.black,
+  },
+  pulseDot: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 8,
+    height: 8,
+    backgroundColor: COLORS.black,
+    ...BORDER_1BIT,
   },
 });
