@@ -32,7 +32,10 @@ import modal
 # ────────────────────────────────────────────────────────────────────────────
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
+    # libchromaprint-tools provides the `fpcalc` binary that pyacoustid
+    # shells out to for audio fingerprinting. Tiny dep (~2 MB) and
+    # rebuild-cheap because it lands on the same apt layer as ffmpeg.
+    .apt_install("ffmpeg", "libchromaprint-tools")
     .pip_install(
         "demucs==4.0.1",
         "supabase==2.11.0",
@@ -45,9 +48,14 @@ image = (
         "soundfile==0.12.1",
     )
     # HTTP layer for the /upload endpoint (FastAPI + httpx for JWT verify).
+    # pyacoustid is the AcoustID HTTP client — together with fpcalc it
+    # lets us identify songs from their audio when the user-supplied
+    # title/artist is generic or wrong, dramatically improving downstream
+    # lyric lookup accuracy.
     .pip_install(
         "fastapi[standard]",
         "httpx",
+        "pyacoustid",
     )
     # yt-dlp for YouTube audio ingest (separate layer so we can bump it
     # independently — yt-dlp updates frequently to track YouTube changes).
@@ -325,6 +333,7 @@ def process_song(
     """
     from supabase import create_client
 
+    from pipeline.identify import identify_song, looks_generic
     from pipeline.lyrics_verify import prefetch_lrclib, verify_lyrics
     from pipeline.notes import quantize_notes
     from pipeline.phrases import detect_phrases
@@ -443,8 +452,22 @@ def process_song(
                 "status": "stemming",
             }).eq("id", song_id).execute()
 
-        stage("stemming", 0.15, "separating vocals from music")
-        stem_dir = run_demucs(original, tmp_dir / "out")
+        # Fingerprint the original BEFORE demucs so the AcoustID HTTP
+        # round trip (~1-2s) overlaps with stemming (~30-60s). The
+        # resolved title/artist feeds LRCLIB prefetch — without this,
+        # files named "track01.mp3" or YouTube uploader-as-artist would
+        # never find canonical lyrics.
+        from concurrent.futures import ThreadPoolExecutor as _IdPool
+        with _IdPool(max_workers=2) as _idex:
+            f_id = _idex.submit(identify_song, original)
+            f_demucs = _idex.submit(run_demucs, original, tmp_dir / "out")
+            stage("stemming", 0.15, "separating vocals from music")
+            stem_dir = f_demucs.result()
+            try:
+                fingerprint = f_id.result()
+            except Exception as _e:
+                print(f"[process_song] identify failed: {_e}")
+                fingerprint = None
         vocals = stem_dir / "vocals.wav"
         drums = stem_dir / "drums.wav"
 
@@ -465,6 +488,30 @@ def process_song(
                 song_artist = (song_row.data or {}).get("artist")
             except Exception as e:
                 print(f"[process_song] song lookup failed: {e}")
+
+        # Apply fingerprint identification when the user's metadata is
+        # generic / placeholder — e.g. uploaded as "track01.mp3" or with
+        # YouTube uploader (often a channel name, not the actual artist)
+        # as the artist. We never overwrite a clearly user-typed title;
+        # the bar to override is set by `looks_generic`.
+        if fingerprint:
+            applied: dict = {}
+            if looks_generic(song_name):
+                song_name = fingerprint["title"] or song_name
+                if song_name:
+                    applied["name"] = song_name
+            if looks_generic(song_artist) and fingerprint.get("artist"):
+                song_artist = fingerprint["artist"]
+                applied["artist"] = song_artist
+            if applied and user_id:
+                try:
+                    sb.table("songs").update(applied).eq("id", song_id).execute()
+                    print(
+                        f"[process_song] applied fingerprint: "
+                        f"{applied} (score={fingerprint['score']:.2f})"
+                    )
+                except Exception as _e:
+                    print(f"[process_song] fingerprint apply failed: {_e}")
 
         # Decode vocals once at 16kHz mono. Both whisperx and torchcrepe
         # consume this exact shape, so passing the array to both is a
@@ -507,7 +554,9 @@ def process_song(
         # in lyrics_verify.py.
         if words:
             stage("whisper", 0.55, "verifying lyrics")
-            words, lyrics_source = verify_lyrics(words, song_name, song_artist)
+            words, lyrics_source = verify_lyrics(
+                words, song_name, song_artist, vocals_path=vocals,
+            )
             print(f"[process_song] lyrics source: {lyrics_source}")
 
         stage("pitch", 0.70, "matching notes to words")
