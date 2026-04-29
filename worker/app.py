@@ -265,7 +265,11 @@ def _yt_download(url: str, dest: Path) -> dict:
 @app.function(
     gpu="T4",
     timeout=1800,
-    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
+    secrets=[
+        modal.Secret.from_name("supabase"),
+        modal.Secret.from_name("iproyal"),
+        modal.Secret.from_name("lyrics-providers"),
+    ],
     volumes=MODEL_VOLUMES,
 )
 def demucs_split(original_url: str, song_id: str) -> dict:
@@ -304,7 +308,11 @@ def demucs_split(original_url: str, song_id: str) -> dict:
 @app.function(
     gpu="T4",
     timeout=1800,
-    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
+    secrets=[
+        modal.Secret.from_name("supabase"),
+        modal.Secret.from_name("iproyal"),
+        modal.Secret.from_name("lyrics-providers"),
+    ],
     volumes=MODEL_VOLUMES,
     # Keep the GPU container warm for 10 minutes after a run finishes.
     # Cheap on the way out (you're already past scale-to-zero), big win
@@ -684,7 +692,11 @@ def process_song(
 
 
 @app.function(
-    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
+    secrets=[
+        modal.Secret.from_name("supabase"),
+        modal.Secret.from_name("iproyal"),
+        modal.Secret.from_name("lyrics-providers"),
+    ],
     timeout=120,
     # Keep one CPU container warm so the FastAPI ASGI app doesn't pay a
     # 5-15s cold-start on the first /upload of the day. ~$2/mo at Modal's
@@ -856,7 +868,11 @@ def api():
 
 @app.function(
     timeout=120,
-    secrets=[modal.Secret.from_name("supabase"), modal.Secret.from_name("iproyal")],
+    secrets=[
+        modal.Secret.from_name("supabase"),
+        modal.Secret.from_name("iproyal"),
+        modal.Secret.from_name("lyrics-providers"),
+    ],
     volumes=MODEL_VOLUMES,
 )
 def yt_smoke(youtube_url: str) -> dict:
