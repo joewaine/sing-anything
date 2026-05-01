@@ -12,6 +12,21 @@ export async function getJob(id: string): Promise<Job> {
   return data as Job;
 }
 
+/** Fetch the latest non-terminal job for each of the current user's songs.
+ *  Used by the Library to seed live progress on cold load — Realtime alone
+ *  only delivers events that happen after subscribe, so we'd miss the
+ *  state of any job that was already running when the user navigated in. */
+export async function listActiveJobs(): Promise<Job[]> {
+  const supabase = requireSupabase();
+  const { data, error } = await supabase
+    .from('jobs')
+    .select('*')
+    .not('stage', 'in', '(done,error)')
+    .order('updated_at', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as Job[];
+}
+
 /** Subscribes to UPDATE events on a specific job row. Returns an unsubscribe fn.
  *
  *  Race notes:

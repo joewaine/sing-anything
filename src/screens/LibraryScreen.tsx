@@ -10,11 +10,28 @@ import {
 } from 'react-native';
 import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
+import { listActiveJobs } from '../lib/jobs';
 import { deleteSong, listSongs, updateSongName } from '../lib/songs';
 import { hasSupabaseConfig, requireSupabase } from '../lib/supabase';
 import { retryProcessing } from '../lib/upload';
 import { BORDER_1BIT, COLORS, FONTS } from '../theme';
-import type { Song } from '../types';
+import type { Job, JobStage, Song } from '../types';
+
+/** Live stage labels for the Library row. The bare song.status is too
+ *  coarse — a song sits in 'stemming' for the entire 60-90s pipeline run
+ *  while the worker is actually doing four different things. Showing the
+ *  job.stage instead gives the user real-time signal that things are
+ *  happening (and lets them estimate when it'll be done). */
+const STAGE_LABEL: Record<JobStage, string> = {
+  queued: 'Queued',
+  upload: 'Downloading',
+  stemming: 'Splitting stems',
+  whisper: 'Transcribing lyrics',
+  pitch: 'Tracking pitch',
+  slicing: 'Slicing phrases',
+  done: 'Ready',
+  error: 'Error',
+};
 
 /** Map raw worker / reaper error strings to friendlier copy for the Library
  *  row. Anything that doesn't match a known prefix falls through unchanged
@@ -54,6 +71,9 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
   const [songs, setSongs] = useState<Song[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  // Active job per song. Driven by initial fetch + Realtime jobs UPDATEs.
+  // Used to show fine-grained progress while a song is processing.
+  const [jobBySong, setJobBySong] = useState<Record<string, Job>>({});
 
   const refresh = async () => {
     if (!hasSupabaseConfig) {
@@ -62,8 +82,16 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
     }
     try {
       setError(null);
-      const rows = await listSongs();
+      const [rows, jobs] = await Promise.all([listSongs(), listActiveJobs()]);
       setSongs(rows);
+      const map: Record<string, Job> = {};
+      for (const j of jobs) {
+        if (!j.song_id) continue;
+        // listActiveJobs returns updated_at desc, so first hit per song
+        // is the freshest non-terminal job.
+        if (!map[j.song_id]) map[j.song_id] = j;
+      }
+      setJobBySong(map);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSongs([]);
@@ -129,6 +157,50 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
             const id = (payload.old as { id?: string }).id;
             if (!id) return;
             setSongs((prev) => (prev ? prev.filter((s) => s.id !== id) : prev));
+            setJobBySong((prev) => {
+              if (!(id in prev)) return prev;
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'jobs',
+            filter: `user_id=eq.${user.id}`,
+          },
+          (payload) => {
+            const newRow = payload.new as Job | null;
+            const oldRow = payload.old as { id?: string; song_id?: string | null } | null;
+            // INSERT / UPDATE: store the freshest job per song. Once it
+            // reaches a terminal stage we drop it from the map so the UI
+            // falls back to the song.status label (Ready / Error).
+            if (newRow && newRow.song_id) {
+              if (newRow.stage === 'done' || newRow.stage === 'error') {
+                setJobBySong((prev) => {
+                  if (!(newRow.song_id! in prev)) return prev;
+                  const next = { ...prev };
+                  delete next[newRow.song_id!];
+                  return next;
+                });
+              } else {
+                setJobBySong((prev) => ({ ...prev, [newRow.song_id!]: newRow }));
+              }
+              return;
+            }
+            // DELETE: clear the entry by song_id if we have it.
+            if (oldRow?.song_id) {
+              setJobBySong((prev) => {
+                if (!(oldRow.song_id! in prev)) return prev;
+                const next = { ...prev };
+                delete next[oldRow.song_id!];
+                return next;
+              });
+            }
           },
         )
         .subscribe();
@@ -189,6 +261,7 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
             renderItem={({ item }) => (
               <SongRow
                 song={item}
+                liveJob={jobBySong[item.id] ?? null}
                 editing={editingId === item.id}
                 onStartEdit={() => setEditingId(item.id)}
                 onStopEdit={() => setEditingId(null)}
@@ -206,6 +279,7 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
 
 type RowProps = {
   song: Song;
+  liveJob: Job | null;
   editing: boolean;
   onStartEdit: () => void;
   onStopEdit: () => void;
@@ -216,6 +290,7 @@ type RowProps = {
 
 function SongRow({
   song,
+  liveJob,
   editing,
   onStartEdit,
   onStopEdit,
@@ -333,10 +408,26 @@ function SongRow({
           </Text>
         </Pressable>
         {/* Artist subtitle intentionally hidden in the library list — title alone is the read-target. */}
-        <Text style={[styles.rowStatus, isError && styles.rowStatusError]}>
-          {STATUS_LABEL[song.status] ?? song.status}
-          {isError ? ` — ${friendlyError(song.error)}` : ''}
-        </Text>
+        {/* Live stage from the active job whenever one's in flight; otherwise
+            fall back to the coarse song.status. The job-level signal is
+            much more useful (the song hangs in 'stemming' for ~75s while
+            the worker is actually doing 4 different things). */}
+        {liveJob && !isReady && !isError ? (
+          <View style={styles.liveStageBlock}>
+            <Text style={styles.rowStatus}>
+              {STAGE_LABEL[liveJob.stage] ?? liveJob.stage}
+              {liveStageDetail(liveJob)}
+            </Text>
+            {typeof liveJob.progress === 'number' && Number(liveJob.progress) > 0 && (
+              <ProgressBar value={Number(liveJob.progress)} />
+            )}
+          </View>
+        ) : (
+          <Text style={[styles.rowStatus, isError && styles.rowStatusError]}>
+            {STATUS_LABEL[song.status] ?? song.status}
+            {isError ? ` — ${friendlyError(song.error)}` : ''}
+          </Text>
+        )}
         {rowErr && <Text style={styles.rowError}>{rowErr}</Text>}
       </View>
       <View style={styles.rowActions}>
@@ -390,6 +481,27 @@ function SongRow({
   );
 }
 
+/** Suppress the message half of "Stage — message" when the message is
+ *  redundant ("queued — queued") or empty. The detailed copy emitted by
+ *  the worker (e.g. "separating vocals from music") IS worth surfacing,
+ *  so we only filter the cases that would be noise. */
+function liveStageDetail(job: Job): string {
+  const msg = job.message?.trim();
+  if (!msg) return '';
+  if (msg.toLowerCase() === job.stage.toLowerCase()) return '';
+  if (msg.toLowerCase().startsWith('queued')) return '';
+  return ` — ${msg}`;
+}
+
+function ProgressBar({ value }: { value: number }) {
+  const pct = Math.max(0, Math.min(1, value)) * 100;
+  return (
+    <View style={styles.barOuter}>
+      <View style={[styles.barFill, { width: `${pct}%` }]} />
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1, paddingHorizontal: 20, paddingTop: 20, paddingBottom: 24 },
   header: {
@@ -433,6 +545,14 @@ const styles = StyleSheet.create({
   rowArtist: { fontFamily: FONTS.monaco, fontSize: 11, color: COLORS.softGrey, marginTop: 2 },
   rowStatus: { fontFamily: FONTS.monaco, fontSize: 11, color: COLORS.black, marginTop: 4 },
   rowStatusError: { color: '#c00' },
+  liveStageBlock: { marginTop: 4, gap: 4 },
+  barOuter: {
+    ...BORDER_1BIT,
+    width: 160,
+    height: 6,
+    backgroundColor: COLORS.white,
+  },
+  barFill: { height: '100%', backgroundColor: COLORS.black },
   titlePressed: { opacity: 0.55 },
   rowActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   playBtn: {

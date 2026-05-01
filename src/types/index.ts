@@ -50,6 +50,7 @@ export type Attempt = {
 };
 
 export type JobStage =
+  | 'queued'
   | 'upload'
   | 'stemming'
   | 'whisper'

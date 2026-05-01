@@ -248,8 +248,8 @@ export async function uploadFromYoutube(
   await insertSong({
     id: songId,
     user_id: userId,
-    slug: `youtube-${songId.slice(0, 8)}`,
-    name: 'Downloading from YouTube…',
+    slug: `url-${songId.slice(0, 8)}`,
+    name: 'Fetching audio…',
     artist: null,
     original_path: originalPath,
   });
