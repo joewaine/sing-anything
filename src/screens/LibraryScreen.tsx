@@ -192,6 +192,34 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
                   delete next[newRow.song_id!];
                   return next;
                 });
+                // Worker writes songs.status BEFORE emitting the terminal
+                // jobs UPDATE — but Supabase Realtime occasionally drops
+                // events under flaky networks, and a dropped songs UPDATE
+                // would leave the row stuck on the old status forever
+                // (the live job is gone, but song.status still says
+                // "stemming"). Optimistically flip status here; if the
+                // real songs UPDATE arrives later it'll just re-write
+                // the same value. Error message comes from the job's
+                // last message field since we may not get the songs
+                // UPDATE that carries songs.error.
+                const optimistic: 'ready' | 'error' =
+                  newRow.stage === 'done' ? 'ready' : 'error';
+                setSongs((prev) =>
+                  prev
+                    ? prev.map((s) =>
+                        s.id !== newRow.song_id || s.status === optimistic
+                          ? s
+                          : {
+                              ...s,
+                              status: optimistic,
+                              error:
+                                optimistic === 'error'
+                                  ? newRow.message ?? s.error
+                                  : s.error,
+                            },
+                      )
+                    : prev,
+                );
               } else {
                 setJobBySong((prev) => ({ ...prev, [newRow.song_id!]: newRow }));
               }
@@ -218,6 +246,23 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
       unsub?.();
     };
   }, []);
+
+  // Safety net: while any song is in a non-terminal status, poll the
+  // server every 15s. Covers the rare case where Realtime drops both
+  // the songs UPDATE *and* the terminal jobs UPDATE — without this,
+  // the row hangs indefinitely until the user navigates away.
+  useEffect(() => {
+    if (!hasSupabaseConfig) return;
+    if (!songs || songs.length === 0) return;
+    const anyInflight = songs.some(
+      (s) => s.status !== 'ready' && s.status !== 'error',
+    );
+    if (!anyInflight) return;
+    const id = setInterval(() => {
+      void refresh();
+    }, 15_000);
+    return () => clearInterval(id);
+  }, [songs]);
 
   const applyRename = (id: string, name: string) => {
     setSongs((prev) => (prev ? prev.map((s) => (s.id === id ? { ...s, name } : s)) : prev));
