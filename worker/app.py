@@ -580,10 +580,10 @@ def process_song(
         # 3-5-line "verse" grouping in that case.
         try:
             sections = detect_sections(original, words, int(duration_s * 1000))
-            print(
-                f"[process_song] sections: {len(sections)} — "
-                f"{', '.join(f'{s['label']}#{s['index_in_label']}' for s in sections)}"
+            sec_summary = ", ".join(
+                f"{s['label']}#{s['index_in_label']}" for s in sections
             )
+            print(f"[process_song] sections: {len(sections)} — {sec_summary}")
         except Exception as _e:
             print(f"[process_song] section detection failed: {_e}")
             sections = []
