@@ -20,16 +20,7 @@ export type Song = {
   created_at: string;
 };
 
-export type SectionLabel = 'intro' | 'verse' | 'chorus' | 'bridge' | 'outro';
-export type PhraseType = 'line' | 'whole_song' | SectionLabel;
-
-export const SECTION_LABELS: SectionLabel[] = [
-  'intro',
-  'verse',
-  'chorus',
-  'bridge',
-  'outro',
-];
+export type PhraseType = 'line' | 'verse' | 'whole_song';
 
 export type Phrase = {
   id: string;
@@ -37,11 +28,6 @@ export type Phrase = {
   user_id: string;
   slug: string;
   phrase_type: PhraseType;
-  /** 1-based occurrence within `phrase_type` for repeating sections (so
-   *  the second 'chorus' phrase has section_index=2). NULL for non-section
-   *  phrase types ('line', 'whole_song') and for legacy rows produced
-   *  before the section detector was wired in. */
-  section_index: number | null;
   start_ms: number;
   end_ms: number;
   duration_ms: number;

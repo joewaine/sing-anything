@@ -105,19 +105,8 @@ def detect_phrases(
     notes: list[dict],
     words: list[dict],
     drums_path: Path | None = None,
-    sections: list[dict] | None = None,
 ) -> list[dict]:
-    """Return list of phrase dicts (line + section + whole_song types).
-
-    `sections` is the output of pipeline.sections.detect_sections — labeled
-    structural segments (intro / verse / chorus / bridge / outro). When
-    provided, we emit ONE phrase per section instead of the legacy
-    arbitrary 3-5-line "verse" groupings; each section phrase has its
-    label as `phrase_type` and a per-label index in `section_index` (so
-    the picker can render "Verse 2", "Chorus", etc.).
-
-    When `sections` is None or empty (e.g. song too short, beat track
-    failed), we fall back to the legacy 3-5-line grouping.
+    """Return list of phrase dicts (line + verse types).
 
     `vocals_path` is unused for boundary detection now (kept for backward
     compatibility with the worker call site); it's still used to compute
@@ -187,101 +176,46 @@ def detect_phrases(
     for line in lines:
         line["tempo_bpm"] = tempo_bpm
 
-    # Build section phrases. Two paths:
-    #
-    # 1) Structural sections from pipeline.sections (preferred). Each
-    #    detected section becomes one phrase with phrase_type = section
-    #    label ('intro' / 'verse' / 'chorus' / 'bridge' / 'outro').
-    #    Notes and lyric_text are aggregated from any LINE that falls
-    #    inside the section's [start_ms, end_ms] window.
-    #
-    # 2) Fallback (no sections): legacy 3-5-line grouping with
-    #    phrase_type='verse'. Triggered when the song is too short or
-    #    beat tracking failed.
-    section_phrases: list[dict] = []
-
-    def lines_in_window(window_start: int, window_end: int) -> list[dict]:
-        # Inclusive of the line if its start anchor is inside the section,
-        # even if the line's tail crosses a boundary by a few ms — beat
-        # boundaries don't always align perfectly with sung phrasing.
-        return [
-            ln for ln in lines
-            if ln["start_ms"] >= window_start and ln["start_ms"] < window_end
-        ]
-
-    def build_section_phrase(
-        sec_start: int,
-        sec_end: int,
-        sec_label: str,
-        sec_index: int,
-        sec_lines: list[dict],
-    ) -> dict | None:
-        if not sec_lines:
-            return None
-        sec_clip0 = clip_offset(sec_start)
-        sec_notes: list[dict] = []
-        for g in sec_lines:
-            line_clip0 = clip_offset(g["start_ms"])
-            offset = line_clip0 - sec_clip0
-            for n in g["notes"]:
-                sec_notes.append({
-                    **n,
-                    "start_ms": n["start_ms"] + offset,
-                    "end_ms": n["end_ms"] + offset,
-                })
-        return {
-            "start_ms": sec_start,
-            "end_ms": sec_end,
-            "duration_ms": clip_duration(sec_start, sec_end),
-            "phrase_type": sec_label,
-            "section_index": sec_index,
-            "lyric_text": " ".join(
-                g["lyric_text"] for g in sec_lines if g["lyric_text"]
-            ),
-            "notes": sec_notes,
-            "tempo_bpm": tempo_bpm,
-        }
-
-    if sections:
-        for sec in sections:
-            sec_lines = lines_in_window(sec["start_ms"], sec["end_ms"])
-            phrase = build_section_phrase(
-                sec_start=sec["start_ms"],
-                sec_end=sec["end_ms"],
-                sec_label=sec["label"],
-                sec_index=int(sec.get("index_in_label", 1)),
-                sec_lines=sec_lines,
-            )
-            if phrase is not None:
-                section_phrases.append(phrase)
-    else:
-        i = 0
-        verse_idx = 0
-        while i < len(lines):
-            group: list[dict] = []
-            j = i
-            group_start = lines[i]["start_ms"]
-            while j < len(lines):
-                if len(group) >= VERSE_MAX_LINES:
-                    break
-                if (lines[j]["end_ms"] - group_start) > MAX_VERSE_MS:
-                    break
-                group.append(lines[j])
-                j += 1
-            if len(group) >= VERSE_MIN_LINES:
-                verse_idx += 1
-                phrase = build_section_phrase(
-                    sec_start=group[0]["start_ms"],
-                    sec_end=group[-1]["end_ms"],
-                    sec_label="verse",
-                    sec_index=verse_idx,
-                    sec_lines=group,
-                )
-                if phrase is not None:
-                    section_phrases.append(phrase)
-                i += len(group)
-            else:
-                i += 1
+    # Build verse phrases (3–5 consecutive lines, capped at MAX_VERSE_MS).
+    verses: list[dict] = []
+    i = 0
+    while i < len(lines):
+        group: list[dict] = []
+        j = i
+        group_start = lines[i]["start_ms"]
+        while j < len(lines):
+            if len(group) >= VERSE_MAX_LINES:
+                break
+            if (lines[j]["end_ms"] - group_start) > MAX_VERSE_MS:
+                break
+            group.append(lines[j])
+            j += 1
+        if len(group) >= VERSE_MIN_LINES:
+            verse_start = group[0]["start_ms"]
+            verse_end = group[-1]["end_ms"]
+            verse_clip0 = clip_offset(verse_start)
+            verse_notes: list[dict] = []
+            for g in group:
+                line_clip0 = clip_offset(g["start_ms"])
+                offset = line_clip0 - verse_clip0
+                for n in g["notes"]:
+                    verse_notes.append({
+                        **n,
+                        "start_ms": n["start_ms"] + offset,
+                        "end_ms": n["end_ms"] + offset,
+                    })
+            verses.append({
+                "start_ms": verse_start,
+                "end_ms": verse_end,
+                "duration_ms": clip_duration(verse_start, verse_end),
+                "phrase_type": "verse",
+                "lyric_text": " ".join(g["lyric_text"] for g in group if g["lyric_text"]),
+                "notes": verse_notes,
+                "tempo_bpm": tempo_bpm,
+            })
+            i += len(group)
+        else:
+            i += 1
 
     # Whole-song phrase: practice / sing-along to the entire track. The
     # vocal stem itself is the "lyric_text", notes are the full song's
@@ -320,4 +254,4 @@ def detect_phrases(
         "tempo_bpm": tempo_bpm,
     }
 
-    return [whole_song] + lines + section_phrases
+    return [whole_song] + lines + verses
