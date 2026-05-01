@@ -170,15 +170,6 @@ export default function UploadScreen({ onBack, onReady, onShowTerms }: Props) {
                   </View>
                 </>
               )}
-              <Text style={styles.disclaimer}>
-                Only upload songs you own or have rights to practice with.
-                {onShowTerms ? ' ' : ''}
-                {onShowTerms && (
-                  <Text style={styles.disclaimerLink} onPress={onShowTerms}>
-                    See terms.
-                  </Text>
-                )}
-              </Text>
             </View>
           )}
 
@@ -251,6 +242,12 @@ export default function UploadScreen({ onBack, onReady, onShowTerms }: Props) {
             </View>
           )}
         </View>
+
+        {onShowTerms && (
+          <Text style={styles.footerLink} onPress={onShowTerms}>
+            Terms & Conditions
+          </Text>
+        )}
       </View>
     </Chrome>
   );
@@ -302,17 +299,13 @@ const styles = StyleSheet.create({
     marginTop: 8,
     maxWidth: 320,
   },
-  disclaimer: {
+  footerLink: {
     fontFamily: FONTS.monaco,
-    fontSize: 10,
+    fontSize: 11,
     color: COLORS.softGrey,
     textAlign: 'center',
-    marginTop: 16,
-    maxWidth: 300,
-  },
-  disclaimerLink: {
-    color: COLORS.black,
     textDecorationLine: 'underline',
+    marginTop: 12,
   },
   orLabel: {
     fontFamily: FONTS.monaco,
