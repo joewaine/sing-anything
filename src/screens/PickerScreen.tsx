@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
-import { listPhrases, type PhraseListRow } from '../lib/phrases';
+import { listPhrases, listSections, type PhraseListRow } from '../lib/phrases';
 import { getSong } from '../lib/songs';
 import { BORDER_1BIT, COLORS, FONTS } from '../theme';
 import type { Song } from '../types';
@@ -13,12 +13,30 @@ type Props = {
   onBack: () => void;
 };
 
-// Prefer verses; fall back to lines for short / sparse songs that didn't
-// emit any verse groupings.
+const SECTION_DISPLAY: Record<string, string> = {
+  intro: 'Intro',
+  verse: 'Verse',
+  chorus: 'Chorus',
+  bridge: 'Bridge',
+  outro: 'Outro',
+};
+
+/** Pretty-print a section phrase's label with its index, e.g. "Verse 2",
+ *  "Chorus", "Intro". Bridges/intros/outros usually appear once; we still
+ *  number them when they don't, so a song with two bridges shows
+ *  "Bridge 1" / "Bridge 2" instead of two indistinguishable rows. */
+function sectionTitle(p: PhraseListRow, totalForType: number): string {
+  const base = SECTION_DISPLAY[p.phrase_type] ?? p.phrase_type;
+  if (totalForType <= 1) return base;
+  return `${base} ${p.section_index ?? ''}`.trim();
+}
+
+// Prefer structural sections (intro/verse/chorus/...); fall back to lines
+// for songs too short for the section detector.
 export default function PickerScreen({ songId, onPick, onBack }: Props) {
   const [song, setSong] = useState<Song | null>(null);
   const [phrases, setPhrases] = useState<PhraseListRow[] | null>(null);
-  const [phraseType, setPhraseType] = useState<'verse' | 'line' | null>(null);
+  const [mode, setMode] = useState<'section' | 'line' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [wholeSong, setWholeSong] = useState<PhraseListRow | null>(null);
@@ -26,30 +44,29 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
   useEffect(() => {
     let cancelled = false;
     setPhrases(null);
-    setPhraseType(null);
+    setMode(null);
     setWholeSong(null);
     setError(null);
     (async () => {
       try {
-        const [s, verses, wholeSongs] = await Promise.all([
+        const [s, sections, wholeSongs] = await Promise.all([
           getSong(songId),
-          listPhrases(songId, 'verse'),
+          listSections(songId),
           listPhrases(songId, 'whole_song'),
         ]);
         if (cancelled) return;
         setSong(s);
         setWholeSong(wholeSongs[0] ?? null);
-        if (verses.length > 0) {
-          setPhrases(verses);
-          setPhraseType('verse');
+        if (sections.length > 0) {
+          setPhrases(sections);
+          setMode('section');
           return;
         }
-        // No verses → song is short or sparse; show its individual lines
-        // instead of an empty state.
+        // No sections → short or sparse song; fall back to per-line.
         const lines = await listPhrases(songId, 'line');
         if (cancelled) return;
         setPhrases(lines);
-        setPhraseType(lines.length > 0 ? 'line' : null);
+        setMode(lines.length > 0 ? 'line' : null);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -60,6 +77,15 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
       cancelled = true;
     };
   }, [songId]);
+
+  // Tally how many phrases share each section label so we know whether to
+  // show "Verse 2" vs just "Verse". Memoize on the phrases array.
+  const typeCounts: Record<string, number> = {};
+  if (phrases) {
+    for (const p of phrases) {
+      typeCounts[p.phrase_type] = (typeCounts[p.phrase_type] ?? 0) + 1;
+    }
+  }
 
   return (
     <Chrome title={song?.name ?? 'Pick a phrase'}>
@@ -116,7 +142,7 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
                 <Text style={styles.sectionLabel}>OR PRACTICE A PIECE</Text>
               </>
             )}
-            {phraseType === 'line' && (
+            {mode === 'line' && (
               <Text style={styles.modeNote}>
                 This song is short — showing individual lines.
               </Text>
@@ -126,7 +152,13 @@ export default function PickerScreen({ songId, onPick, onBack }: Props) {
               keyExtractor={(p) => p.id}
               ItemSeparatorComponent={() => <View style={styles.sep} />}
               renderItem={({ item, index }) => (
-                <PhraseRow phrase={item} index={index} onPick={onPick} />
+                <PhraseRow
+                  phrase={item}
+                  index={index}
+                  onPick={onPick}
+                  mode={mode}
+                  totalForType={typeCounts[item.phrase_type] ?? 0}
+                />
               )}
             />
           </>
@@ -140,20 +172,32 @@ function PhraseRow({
   phrase,
   index,
   onPick,
+  mode,
+  totalForType,
 }: {
   phrase: PhraseListRow;
   index: number;
   onPick: (p: PhraseListRow) => void;
+  mode: 'section' | 'line' | null;
+  totalForType: number;
 }) {
   const dur = (phrase.duration_ms / 1000).toFixed(1);
+  const isSection = mode === 'section';
+  const title = isSection ? sectionTitle(phrase, totalForType) : null;
   return (
     <Pressable
       onPress={() => onPick(phrase)}
       style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
     >
-      <View style={styles.idxBubble}>
-        <Text style={styles.idxText}>{index + 1}</Text>
-      </View>
+      {isSection ? (
+        <View style={styles.sectionBadge}>
+          <Text style={styles.sectionBadgeText}>{title}</Text>
+        </View>
+      ) : (
+        <View style={styles.idxBubble}>
+          <Text style={styles.idxText}>{index + 1}</Text>
+        </View>
+      )}
       <View style={{ flex: 1 }}>
         <Text style={styles.rowLyric} numberOfLines={2}>
           {phrase.lyric_text || '(instrumental)'}
@@ -255,6 +299,23 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   idxText: { fontFamily: FONTS.chicago, fontWeight: '700', fontSize: 12 },
+  sectionBadge: {
+    minWidth: 64,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.black,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sectionBadgeText: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 11,
+    letterSpacing: 1,
+    color: COLORS.white,
+    textAlign: 'center',
+  },
   rowLyric: { fontFamily: FONTS.chicago, fontWeight: '700', fontSize: 14, letterSpacing: -0.2 },
   rowMeta: { fontFamily: FONTS.monaco, fontSize: 11, color: COLORS.softGrey, marginTop: 2 },
   chevron: { fontFamily: FONTS.chicago, fontSize: 18 },

@@ -345,6 +345,7 @@ def process_song(
     from pipeline.lyrics_verify import prefetch_lrclib, verify_lyrics
     from pipeline.notes import quantize_notes
     from pipeline.phrases import detect_phrases
+    from pipeline.sections import detect_sections
     from pipeline.pitch import pitch_curve
     from pipeline.slice import slice_phrase, upload_slice
     from pipeline.stems import mix_backing, run_demucs
@@ -572,10 +573,32 @@ def process_song(
         print(f"[process_song] notes={len(notes)}")
 
         stage("slicing", 0.80, "detecting phrases")
-        phrases = detect_phrases(vocals, notes, words, drums_path=drums)
-        n_line = sum(1 for p in phrases if p["phrase_type"] == "line")
-        n_verse = sum(1 for p in phrases if p["phrase_type"] == "verse")
-        print(f"[process_song] phrases: line={n_line} verse={n_verse}")
+        # Structural sections from the full mix (= the original audio).
+        # Runs on CPU only — no GPU contention with the demucs/whisper/
+        # crepe block above. Returns [] for very short or beat-tracker-
+        # unfriendly songs; detect_phrases falls back to the legacy
+        # 3-5-line "verse" grouping in that case.
+        try:
+            sections = detect_sections(original, words, int(duration_s * 1000))
+            print(
+                f"[process_song] sections: {len(sections)} — "
+                f"{', '.join(f'{s['label']}#{s['index_in_label']}' for s in sections)}"
+            )
+        except Exception as _e:
+            print(f"[process_song] section detection failed: {_e}")
+            sections = []
+
+        phrases = detect_phrases(
+            vocals, notes, words, drums_path=drums, sections=sections,
+        )
+        # Tally each phrase_type for the run log so we can spot regressions.
+        type_counts: dict[str, int] = {}
+        for p in phrases:
+            type_counts[p["phrase_type"]] = type_counts.get(p["phrase_type"], 0) + 1
+        print(
+            "[process_song] phrases: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items()))
+        )
 
         # Persist derived artifacts before slicing. Vocals (FLAC, smaller
         # than the original WAV but lossless), the whisper word JSON, and
@@ -666,6 +689,7 @@ def process_song(
                 "user_id": user_id,
                 "slug": r["slug"],
                 "phrase_type": r["phrase_type"],
+                "section_index": r.get("section_index"),
                 "start_ms": r["start_ms"],
                 "end_ms": r["end_ms"],
                 "duration_ms": r["duration_ms"],

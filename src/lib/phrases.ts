@@ -1,5 +1,5 @@
 import { requireSupabase } from './supabase';
-import type { Phrase, PhraseType, Song } from '../types';
+import { SECTION_LABELS, type Phrase, type PhraseType, type Song } from '../types';
 
 /** Phrase hydrated with its parent song + freshly-signed URLs for the audio.
  *  The `phrases` bucket is private, so every playback needs a signed URL
@@ -45,6 +45,9 @@ async function signUrl(path: string): Promise<string> {
 // N times on the wire.
 export type PhraseListRow = Omit<PhraseSummary, 'song'>;
 
+const PHRASE_LIST_COLS =
+  'id, song_id, user_id, slug, phrase_type, section_index, start_ms, end_ms, duration_ms, tempo_bpm, lyric_text, vocals_path, backing_path';
+
 export async function listPhrases(
   songId: string,
   phraseType: PhraseType = 'line',
@@ -52,11 +55,25 @@ export async function listPhrases(
   const supabase = requireSupabase();
   const { data, error } = await supabase
     .from('phrases')
-    .select(
-      'id, song_id, user_id, slug, phrase_type, start_ms, end_ms, duration_ms, tempo_bpm, lyric_text, vocals_path, backing_path',
-    )
+    .select(PHRASE_LIST_COLS)
     .eq('song_id', songId)
     .eq('phrase_type', phraseType)
+    .order('start_ms');
+  if (error) throw error;
+  return (data ?? []) as unknown as PhraseListRow[];
+}
+
+/** Fetch every phrase that's a structural song section (intro / verse /
+ *  chorus / bridge / outro) ordered by their position in the song. The
+ *  picker uses this so a single query renders all sections in one list,
+ *  rather than firing one fetch per label and stitching client-side. */
+export async function listSections(songId: string): Promise<PhraseListRow[]> {
+  const supabase = requireSupabase();
+  const { data, error } = await supabase
+    .from('phrases')
+    .select(PHRASE_LIST_COLS)
+    .eq('song_id', songId)
+    .in('phrase_type', SECTION_LABELS)
     .order('start_ms');
   if (error) throw error;
   return (data ?? []) as unknown as PhraseListRow[];
