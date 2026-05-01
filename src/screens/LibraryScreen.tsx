@@ -574,7 +574,7 @@ function ProgressBar({ value }: { value: number }) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, paddingHorizontal: 20, paddingTop: 20, paddingBottom: 24 },
+  container: { flex: 1, paddingHorizontal: 20, paddingTop: 40, paddingBottom: 24 },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
