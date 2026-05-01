@@ -754,6 +754,54 @@ def api():
         except Exception as e:
             print(f"[reap] failed (non-fatal): {e}")
 
+    # Per-user quotas. Cheap enough to run on every upload — both queries
+    # hit indexes (jobs.user_id + jobs.stage / songs.user_id + created_at).
+    # Bypass for the demo account so portfolio reviewers can stress-test
+    # without hitting limits; quotas still apply to every other user.
+    DEMO_USER_ID = os.environ.get("DEMO_USER_ID", "")
+    MAX_INFLIGHT_JOBS = 3
+    MAX_DAILY_UPLOADS = 10
+
+    def _check_quota(sb, user_id: str, song_id: str) -> None:
+        if user_id and user_id == DEMO_USER_ID:
+            return
+        # In-flight: any job for this user not in a terminal stage AND not
+        # for the song we're about to enqueue (idempotency handles that).
+        inflight = (
+            sb.table("jobs")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .not_.in_("stage", ["done", "error"])
+            .neq("song_id", song_id)
+            .execute()
+        )
+        n_inflight = inflight.count or 0
+        if n_inflight >= MAX_INFLIGHT_JOBS:
+            raise HTTPException(
+                429,
+                f"You have {n_inflight} songs already processing. Please wait "
+                f"for one to finish before uploading another.",
+            )
+        # Daily cap: songs (not jobs) created in the trailing 24 h. Counting
+        # songs not jobs means a single song that errored and was retried
+        # only counts once.
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        daily = (
+            sb.table("songs")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .gte("created_at", since)
+            .execute()
+        )
+        n_daily = daily.count or 0
+        if n_daily > MAX_DAILY_UPLOADS:
+            raise HTTPException(
+                429,
+                f"Daily upload limit reached ({MAX_DAILY_UPLOADS} songs / 24 h). "
+                f"This keeps the GPU bill in check — try again tomorrow.",
+            )
+
     @web.post("/upload")
     def upload(body: dict, authorization: str | None = Header(None)):
         user_id = _verify_user(authorization)
@@ -783,6 +831,10 @@ def api():
         )
         if existing.data:
             return {"job_id": existing.data[0]["id"], "already_running": True}
+
+        # Quota check runs *after* idempotency so re-calls for the same
+        # in-flight song don't count against the user's in-flight cap.
+        _check_quota(sb, user_id, song_id)
 
         signed = sb.storage.from_("originals").create_signed_url(
             path=song.data["original_path"], expires_in=3600,
@@ -844,6 +896,8 @@ def api():
         )
         if existing.data:
             return {"job_id": existing.data[0]["id"], "already_running": True}
+
+        _check_quota(sb, user_id, song_id)
 
         job = sb.table("jobs").insert({
             "user_id": user_id,

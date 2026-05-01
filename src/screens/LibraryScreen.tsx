@@ -12,8 +12,26 @@ import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
 import { deleteSong, listSongs, updateSongName } from '../lib/songs';
 import { hasSupabaseConfig, requireSupabase } from '../lib/supabase';
+import { retryProcessing } from '../lib/upload';
 import { BORDER_1BIT, COLORS, FONTS } from '../theme';
 import type { Song } from '../types';
+
+/** Map raw worker / reaper error strings to friendlier copy for the Library
+ *  row. Anything that doesn't match a known prefix falls through unchanged
+ *  so we don't accidentally hide useful detail (e.g. quota messages). */
+function friendlyError(raw: string | null | undefined): string {
+  if (!raw) return 'Something went wrong.';
+  const s = raw.trim();
+  if (/stale heartbeat/i.test(s)) {
+    return 'Processing was interrupted. Tap Retry.';
+  }
+  if (/yt-dlp|youtube blocked|sign in to confirm|not a bot/i.test(s)) {
+    return 'Source blocked the download. Try uploading the file directly.';
+  }
+  if (/>10 min cap/.test(s)) return 'Song is too long (10 min max).';
+  if (/exceeds .* bytes/i.test(s)) return 'File is too large.';
+  return s;
+}
 
 type Props = {
   onUpload: () => void;
@@ -212,6 +230,7 @@ function SongRow({
   const [rowErr, setRowErr] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const inputRef = useRef<TextInput>(null);
 
   const doDelete = async () => {
@@ -227,6 +246,20 @@ function SongRow({
       setRowErr(e instanceof Error ? e.message : String(e));
       setDeleting(false);
       setConfirmingDelete(false);
+    }
+  };
+
+  const doRetry = async () => {
+    try {
+      setRetrying(true);
+      setRowErr(null);
+      await retryProcessing(song.id);
+      // Realtime subscription on the parent will flip the row's status
+      // when the worker's first stage() write lands.
+    } catch (e) {
+      setRowErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -302,7 +335,7 @@ function SongRow({
         {/* Artist subtitle intentionally hidden in the library list — title alone is the read-target. */}
         <Text style={[styles.rowStatus, isError && styles.rowStatusError]}>
           {STATUS_LABEL[song.status] ?? song.status}
-          {isError && song.error ? ` — ${song.error}` : ''}
+          {isError ? ` — ${friendlyError(song.error)}` : ''}
         </Text>
         {rowErr && <Text style={styles.rowError}>{rowErr}</Text>}
       </View>
@@ -313,6 +346,15 @@ function SongRow({
             style={({ pressed }) => [styles.playBtn, pressed && styles.playBtnPressed]}
           >
             <Text style={styles.chevron}>▶</Text>
+          </Pressable>
+        )}
+        {isError && !confirmingDelete && (
+          <Pressable
+            onPress={doRetry}
+            disabled={retrying}
+            style={({ pressed }) => [styles.retryBtn, pressed && styles.retryBtnPressed]}
+          >
+            <Text style={styles.retryLabel}>{retrying ? '…' : 'Retry'}</Text>
           </Pressable>
         )}
         {confirmingDelete ? (
@@ -403,6 +445,23 @@ const styles = StyleSheet.create({
   },
   playBtnPressed: { backgroundColor: COLORS.black, transform: [{ translateX: 1 }, { translateY: 1 }] },
   chevron: { fontFamily: FONTS.chicago, fontSize: 14 },
+  retryBtn: {
+    ...BORDER_1BIT,
+    backgroundColor: COLORS.white,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  retryBtnPressed: {
+    backgroundColor: COLORS.black,
+    transform: [{ translateX: 1 }, { translateY: 1 }],
+  },
+  retryLabel: {
+    fontFamily: FONTS.chicago,
+    fontWeight: '700',
+    fontSize: 12,
+    color: COLORS.black,
+    letterSpacing: -0.2,
+  },
   deleteBtn: {
     width: 28,
     height: 28,

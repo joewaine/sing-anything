@@ -18,6 +18,7 @@ import type { Job } from '../types';
 type Props = {
   onBack: () => void;
   onReady: (songId: string) => void;
+  onShowTerms?: () => void;
 };
 
 type Phase =
@@ -42,7 +43,7 @@ const STAGE_LABEL: Record<string, string> = {
   error: 'Failed',
 };
 
-export default function UploadScreen({ onBack, onReady }: Props) {
+export default function UploadScreen({ onBack, onReady, onShowTerms }: Props) {
   const [picked, setPicked] = useState<PickedFile | null>(null);
   const [ytUrl, setYtUrl] = useState('');
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
@@ -171,6 +172,12 @@ export default function UploadScreen({ onBack, onReady }: Props) {
               )}
               <Text style={styles.disclaimer}>
                 Only upload songs you own or have rights to practice with.
+                {onShowTerms ? ' ' : ''}
+                {onShowTerms && (
+                  <Text style={styles.disclaimerLink} onPress={onShowTerms}>
+                    See terms.
+                  </Text>
+                )}
               </Text>
             </View>
           )}
@@ -302,6 +309,10 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 16,
     maxWidth: 300,
+  },
+  disclaimerLink: {
+    color: COLORS.black,
+    textDecorationLine: 'underline',
   },
   orLabel: {
     fontFamily: FONTS.monaco,

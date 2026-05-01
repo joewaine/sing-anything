@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import Chrome from '../components/Chrome';
 import RetroButton from '../components/RetroButton';
 import { requestMagicLink } from '../lib/passkey';
@@ -7,23 +7,41 @@ import { BORDER_1BIT, COLORS, FONTS } from '../theme';
 
 type Props = {
   onUnlock: () => void;
+  onShowPrivacy?: () => void;
+  onShowTerms?: () => void;
 };
 
 type Phase =
   | { kind: 'idle' }
   | { kind: 'sending' }
-  | { kind: 'sent'; email: string }
+  | { kind: 'sent'; email: string; canResend: boolean }
   | { kind: 'error'; message: string };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// How long to wait before letting the user resend a magic link. Resend is
+// idempotent on Supabase's side (same email → same link), but the user has
+// to click *something* if it never arrives — silently sitting on
+// "check your inbox" forever is the failure mode we're avoiding.
+const RESEND_DELAY_MS = 60_000;
 
-export default function PasskeyScreen({ onUnlock }: Props) {
+export default function PasskeyScreen({ onUnlock, onShowPrivacy, onShowTerms }: Props) {
   const [email, setEmail] = useState('');
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
   const inputRef = useRef<TextInput>(null);
 
-  const submit = async () => {
-    const e = email.trim().toLowerCase();
+  // After we land on the "sent" state, unlock the Resend button after a
+  // delay so it isn't immediately spam-able but also doesn't leave the
+  // user stranded if Resend SMTP eats the message.
+  useEffect(() => {
+    if (phase.kind !== 'sent' || phase.canResend) return;
+    const t = setTimeout(() => {
+      setPhase((p) => (p.kind === 'sent' ? { ...p, canResend: true } : p));
+    }, RESEND_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [phase]);
+
+  const submit = async (overrideEmail?: string) => {
+    const e = (overrideEmail ?? email).trim().toLowerCase();
     if (!EMAIL_RE.test(e)) {
       setPhase({ kind: 'error', message: 'That doesn\'t look like an email.' });
       return;
@@ -35,7 +53,7 @@ export default function PasskeyScreen({ onUnlock }: Props) {
         // Demo path — signed in already. Hand off to App.
         onUnlock();
       } else {
-        setPhase({ kind: 'sent', email: e });
+        setPhase({ kind: 'sent', email: e, canResend: false });
       }
     } catch (err) {
       setPhase({
@@ -43,6 +61,11 @@ export default function PasskeyScreen({ onUnlock }: Props) {
         message: err instanceof Error ? err.message : String(err),
       });
     }
+  };
+
+  const resend = () => {
+    if (phase.kind !== 'sent') return;
+    void submit(phase.email);
   };
 
   return (
@@ -68,6 +91,15 @@ export default function PasskeyScreen({ onUnlock }: Props) {
               Click the link in the email to finish signing in. The page will
               update automatically.
             </Text>
+            {phase.canResend ? (
+              <View style={{ marginTop: 14 }}>
+                <RetroButton label="Resend link" onPress={resend} size="md" />
+              </View>
+            ) : (
+              <Text style={[styles.sentHint, { marginTop: 14 }]}>
+                Didn't arrive? You can resend in a minute.
+              </Text>
+            )}
             <Text
               style={styles.tinyLink}
               onPress={() => {
@@ -87,7 +119,7 @@ export default function PasskeyScreen({ onUnlock }: Props) {
                 setEmail(v);
                 if (phase.kind === 'error') setPhase({ kind: 'idle' });
               }}
-              onSubmitEditing={submit}
+              onSubmitEditing={() => submit()}
               placeholder="you@example.com"
               placeholderTextColor={COLORS.softGrey}
               autoCapitalize="none"
@@ -105,7 +137,7 @@ export default function PasskeyScreen({ onUnlock }: Props) {
               ) : (
                 <RetroButton
                   label="Send magic link"
-                  onPress={submit}
+                  onPress={() => submit()}
                   size="lg"
                   icon="play"
                   variant="dark"
@@ -120,6 +152,21 @@ export default function PasskeyScreen({ onUnlock }: Props) {
             Your library is private — only you can see your uploads and
             recordings.
           </Text>
+          {(onShowPrivacy || onShowTerms) && (
+            <View style={styles.footer}>
+              {onShowPrivacy && (
+                <Pressable onPress={onShowPrivacy} hitSlop={6}>
+                  <Text style={styles.footerLink}>Privacy</Text>
+                </Pressable>
+              )}
+              {onShowPrivacy && onShowTerms && <Text style={styles.footerSep}>·</Text>}
+              {onShowTerms && (
+                <Pressable onPress={onShowTerms} hitSlop={6}>
+                  <Text style={styles.footerLink}>Terms</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
         </View>
       </View>
     </Chrome>
@@ -199,7 +246,7 @@ const styles = StyleSheet.create({
     textDecorationLine: 'underline',
     marginTop: 18,
   },
-  bottom: { alignItems: 'center' },
+  bottom: { alignItems: 'center', gap: 12 },
   hint: {
     fontFamily: FONTS.monaco,
     fontSize: 11,
@@ -207,5 +254,21 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     maxWidth: 320,
     lineHeight: 15,
+  },
+  footer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  footerLink: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.black,
+    textDecorationLine: 'underline',
+  },
+  footerSep: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.softGrey,
   },
 });

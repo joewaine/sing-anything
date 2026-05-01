@@ -34,7 +34,7 @@ Both live in the same parent folder as this one (`/Users/josephwaine/fractal/`):
 
 ## What's the same as Sing Beatles
 
-- **Native target**: Expo + React Native targeting iOS and Android (the user asked for iOS + Android; web is a secondary target, don't design around it).
+- **Target platforms (v1)**: web only. The Expo project still targets RN so iOS/Android can be enabled later via EAS, but the deployed surface for v1 is the static web build on Render. This was an explicit launch-readiness call: web ships immediately and lands on a portfolio with no Apple/Google fees or store review. Reopen this decision once usage justifies a native build.
 - **Retro 1-bit Mac aesthetic**: reuse `src/theme.ts` and the `FONTS` + `BORDER_1BIT` constants. Copy `Chrome.tsx`, `RetroButton.tsx`, `FontLoader.tsx` directly.
 - **Auth**: Supabase anonymous sign-in. See `sing-beatles/src/lib/auth.ts` — copy it verbatim.
 - **Session flow**: WelcomeScreen → PickerScreen → SessionScreen → TimelineScreen. Same state machine: `idle → listening → countdown → recording → done`.

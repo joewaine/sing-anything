@@ -3,6 +3,7 @@ import { ActivityIndicator, Platform, StyleSheet, Text, View } from 'react-nativ
 import { StatusBar } from 'expo-status-bar';
 import FontLoader from './src/components/FontLoader';
 import CalibrationScreen from './src/screens/CalibrationScreen';
+import LegalScreen from './src/screens/LegalScreen';
 import LibraryScreen from './src/screens/LibraryScreen';
 import PasskeyScreen from './src/screens/PasskeyScreen';
 import PickerScreen from './src/screens/PickerScreen';
@@ -154,8 +155,24 @@ export default function App() {
         <View style={styles.center}>
           <ActivityIndicator color={COLORS.black} />
         </View>
+      ) : route.screen === 'privacy' ? (
+        // Legal pages are reachable without sign-in so PasskeyScreen can
+        // link to them and external visitors can read them directly.
+        <LegalScreen
+          kind="privacy"
+          onBack={() => setRoute({ screen: unlocked ? 'library' : 'welcome' })}
+        />
+      ) : route.screen === 'terms' ? (
+        <LegalScreen
+          kind="terms"
+          onBack={() => setRoute({ screen: unlocked ? 'library' : 'welcome' })}
+        />
       ) : !unlocked ? (
-        <PasskeyScreen onUnlock={() => setUnlocked(true)} />
+        <PasskeyScreen
+          onUnlock={() => setUnlocked(true)}
+          onShowPrivacy={() => setRoute({ screen: 'privacy' })}
+          onShowTerms={() => setRoute({ screen: 'terms' })}
+        />
       ) : error ? (
         <View style={styles.center}>
           <Text style={styles.errorTitle}>AUTH FAILED</Text>
@@ -184,6 +201,7 @@ export default function App() {
         <UploadScreen
           onBack={() => setRoute({ screen: 'library' })}
           onReady={() => setRoute({ screen: 'library' })}
+          onShowTerms={() => setRoute({ screen: 'terms' })}
         />
       ) : route.screen === 'picker' ? (
         <PickerScreen

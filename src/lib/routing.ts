@@ -13,6 +13,8 @@ export type Route =
   | { screen: 'upload' }
   | { screen: 'takes' }
   | { screen: 'calibrate' }
+  | { screen: 'privacy' }
+  | { screen: 'terms' }
   | { screen: 'picker'; songId: string }
   | { screen: 'session'; phraseId: string; phrase: PhraseWithSong | null };
 
@@ -23,6 +25,8 @@ export function routeToPath(route: Route): string {
     case 'upload': return '/upload';
     case 'takes': return '/takes';
     case 'calibrate': return '/calibrate';
+    case 'privacy': return '/privacy';
+    case 'terms': return '/terms';
     case 'picker': return `/picker/${route.songId}`;
     case 'session': return `/session/${route.phraseId}`;
   }
@@ -35,6 +39,8 @@ export function pathToRoute(raw: string): Route | null {
   if (path === '/upload') return { screen: 'upload' };
   if (path === '/takes') return { screen: 'takes' };
   if (path === '/calibrate') return { screen: 'calibrate' };
+  if (path === '/privacy') return { screen: 'privacy' };
+  if (path === '/terms') return { screen: 'terms' };
 
   const pickerMatch = path.match(/^\/picker\/([a-zA-Z0-9-]+)$/);
   if (pickerMatch) return { screen: 'picker', songId: pickerMatch[1] };
