@@ -53,8 +53,8 @@ const PRIVACY = {
       h: 'How it is used',
       p: [
         'Audio and recordings are stored in private Supabase Storage buckets, scoped to your auth user. We use Postgres row-level security so other users — and unauthenticated visitors — can never read your library.',
-        'Lyric transcripts are sent to LRCLIB (free public API) for matching against canonical lyrics, and to Anthropic (Claude) when LRCLIB has no match. URLs you paste are sent to yt-dlp via a residential proxy for download.',
-        'Practice take pitch summaries (no audio) are sent to Anthropic via a Supabase edge function so Claude can write one sentence of feedback. We do not send your raw recordings to Anthropic.',
+        'Lyric transcripts are sent to LRCLIB (free public API) for matching against canonical lyrics, and to Anthropic when LRCLIB has no match. URLs you paste are sent to yt-dlp via a residential proxy for download.',
+        'Practice take pitch summaries (no audio) are sent to Anthropic via a Supabase edge function so it can write one sentence of feedback. We do not send your raw recordings to Anthropic.',
       ],
     },
     {
@@ -68,7 +68,7 @@ const PRIVACY = {
     {
       h: 'Third parties',
       p: [
-        'Supabase (auth, database, storage). Modal (worker compute). Render (web hosting). IPRoyal (residential proxy for URL ingest). LRCLIB (public lyrics API). Anthropic (Claude — lyrics fallback and coaching feedback). All transit is over TLS.',
+        'Supabase (auth, database, storage). Modal (worker compute). Render (web hosting). IPRoyal (residential proxy for URL ingest). LRCLIB (public lyrics API). Anthropic (lyrics fallback and written feedback). All transit is over TLS.',
       ],
     },
     {

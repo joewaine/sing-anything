@@ -1,6 +1,6 @@
 # Sing All The Time
 
-Upload any song. The app stems it with [Demucs](https://github.com/facebookresearch/demucs), transcribes the lyrics with [WhisperX](https://github.com/m-bain/whisperX), tracks pitch with [torchcrepe](https://github.com/maxrmorrison/torchcrepe), slices it into phrases, and drops you into a karaoke practice loop with pitch feedback and Claude-generated coaching.
+Upload any song. The app stems it with [Demucs](https://github.com/facebookresearch/demucs), transcribes the lyrics with [WhisperX](https://github.com/m-bain/whisperX), tracks pitch with [torchcrepe](https://github.com/maxrmorrison/torchcrepe), slices it into phrases, and drops you into a karaoke practice loop with live pitch feedback and a one-line written takeaway per take.
 
 Live at: <https://sing-anything.onrender.com> *(set this once Render is live)*
 
@@ -9,7 +9,7 @@ Live at: <https://sing-anything.onrender.com> *(set this once Render is live)*
 1. You drop in an audio file or paste a YouTube / SoundCloud / Bandcamp URL.
 2. A Modal GPU worker stems vocals out of the mix, transcribes them with word-level timestamps, tracks pitch, and segments the song into sing-able phrases (≤15 s lines, ≤22 s verses).
 3. You pick a phrase. The app plays a count-in at the song's tempo, scrolls a piano-roll of the target notes synced to the lyrics, records you, and shows your pitch curve overlaid on the target.
-4. Claude (Anthropic, via a Supabase edge function) reads the pitch comparison and writes one warm sentence of feedback per take.
+4. A Supabase edge function reads the pitch comparison and writes one warm sentence of feedback per take.
 
 ## Stack
 
@@ -20,8 +20,8 @@ Live at: <https://sing-anything.onrender.com> *(set this once Render is live)*
 | Storage / DB | Supabase Postgres + Storage, RLS scoped per user |
 | GPU pipeline | Modal — Demucs (htdemucs) → WhisperX → torchcrepe → ffmpeg slicer |
 | URL ingest | yt-dlp behind an IPRoyal residential proxy |
-| Lyrics fallback | LRCLIB → Claude Haiku |
-| Coach | Claude (Anthropic) via Supabase edge function |
+| Lyrics fallback | LRCLIB → Anthropic API |
+| Feedback | Anthropic API via Supabase edge function |
 | Hosting | Render (web), Modal (worker) |
 
 ## Architecture
@@ -168,7 +168,7 @@ sing-anything/
 │   └── theme.ts              # 1-bit retro palette, fonts
 ├── supabase/
 │   ├── migrations/           # schema + RLS
-│   └── functions/feedback/   # Claude-backed coach edge function
+│   └── functions/feedback/   # written-feedback edge function
 ├── worker/
 │   ├── app.py                # Modal app: /upload, /upload_youtube, process_song
 │   └── pipeline/             # stems, transcribe, pitch, notes, phrases, slice, …

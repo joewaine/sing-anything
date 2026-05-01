@@ -248,6 +248,10 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
               Upload a track you own or have rights to practice with. We'll separate
               the vocals, find the phrases, and get out of your way.
             </Text>
+            <Text style={styles.emptyExample}>
+              Try a 1–3 minute song you know well — clear vocals work best.
+              Or paste a SoundCloud, Bandcamp, or YouTube link.
+            </Text>
             <View style={{ marginTop: 16 }}>
               <RetroButton label="Upload a song" onPress={onUpload} size="lg" icon="play" variant="dark" />
             </View>
@@ -526,6 +530,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 17,
     maxWidth: 320,
+  },
+  emptyExample: {
+    fontFamily: FONTS.monaco,
+    fontSize: 11,
+    color: COLORS.softGrey,
+    textAlign: 'center',
+    lineHeight: 16,
+    maxWidth: 320,
+    marginTop: 6,
   },
   errorText: {
     fontFamily: FONTS.monaco,
