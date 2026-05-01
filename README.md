@@ -2,7 +2,7 @@
 
 Upload any song. The app stems it with [Demucs](https://github.com/facebookresearch/demucs), transcribes the lyrics with [WhisperX](https://github.com/m-bain/whisperX), tracks pitch with [torchcrepe](https://github.com/maxrmorrison/torchcrepe), slices it into phrases, and drops you into a karaoke practice loop with live pitch feedback and a one-line written takeaway per take.
 
-Live at: <https://sing-anything.onrender.com> *(set this once Render is live)*
+Live at: <https://singallthetime.com>
 
 ## What it does
 
