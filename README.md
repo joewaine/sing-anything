@@ -145,7 +145,7 @@ To keep the GPU bill predictable, the worker enforces:
 - 30 MB / file (client) and 100 MB / file (worker)
 - 10 minutes max audio duration
 - 3 in-flight jobs per user
-- 10 uploads per user per 24 h
+- 5 songs per library — delete to make room for a new one
 - 1800 s hard timeout per job; stale-heartbeat jobs get reaped after 10 min
 
 ## Privacy / terms

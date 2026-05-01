@@ -755,12 +755,17 @@ def api():
             print(f"[reap] failed (non-fatal): {e}")
 
     # Per-user quotas. Cheap enough to run on every upload — both queries
-    # hit indexes (jobs.user_id + jobs.stage / songs.user_id + created_at).
+    # hit indexes (jobs.user_id + jobs.stage / songs.user_id).
     # Bypass for the demo account so portfolio reviewers can stress-test
     # without hitting limits; quotas still apply to every other user.
     DEMO_USER_ID = os.environ.get("DEMO_USER_ID", "")
     MAX_INFLIGHT_JOBS = 3
-    MAX_DAILY_UPLOADS = 10
+    # Total songs per library. Cheap, simple, and self-balancing — once a
+    # user fills the slots, adding more requires deleting (and deleting
+    # cascades the storage cost away). Beats a daily cap because someone
+    # uploading once a week never hits the daily cap but can still fill
+    # storage indefinitely.
+    MAX_LIBRARY_SONGS = 5
 
     def _check_quota(sb, user_id: str, song_id: str) -> None:
         if user_id and user_id == DEMO_USER_ID:
@@ -782,24 +787,22 @@ def api():
                 f"You have {n_inflight} songs already processing. Please wait "
                 f"for one to finish before uploading another.",
             )
-        # Daily cap: songs (not jobs) created in the trailing 24 h. Counting
-        # songs not jobs means a single song that errored and was retried
-        # only counts once.
-        from datetime import datetime, timedelta, timezone
-        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        daily = (
+        # Library cap: total songs the user owns. The song row we're about
+        # to enqueue is already inserted by the client (so it's counted
+        # below), and the orphan-cleanup path in upload.ts removes it on
+        # this 429 — so the user sees their library at MAX, not MAX+1.
+        total = (
             sb.table("songs")
             .select("id", count="exact")
             .eq("user_id", user_id)
-            .gte("created_at", since)
             .execute()
         )
-        n_daily = daily.count or 0
-        if n_daily > MAX_DAILY_UPLOADS:
+        n_total = total.count or 0
+        if n_total > MAX_LIBRARY_SONGS:
             raise HTTPException(
                 429,
-                f"Daily upload limit reached ({MAX_DAILY_UPLOADS} songs / 24 h). "
-                f"This keeps the GPU bill in check — try again tomorrow.",
+                f"Library is full ({MAX_LIBRARY_SONGS} song max). "
+                f"Delete one to make room.",
             )
 
     @web.post("/upload")

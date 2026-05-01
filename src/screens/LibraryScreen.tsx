@@ -17,6 +17,11 @@ import { retryProcessing } from '../lib/upload';
 import { BORDER_1BIT, COLORS, FONTS } from '../theme';
 import type { Job, JobStage, Song } from '../types';
 
+// Mirrors worker/app.py MAX_LIBRARY_SONGS. Surfacing it on the header
+// means the user sees where they stand before they tap upload, so the
+// 429 from the worker is a backstop rather than the first signal.
+const LIBRARY_CAP = 5;
+
 /** Live stage labels for the Library row. The bare song.status is too
  *  coarse — a song sits in 'stemming' for the entire 60-90s pipeline run
  *  while the worker is actually doing four different things. Showing the
@@ -222,17 +227,33 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
     setSongs((prev) => (prev ? prev.filter((s) => s.id !== id) : prev));
   };
 
+  const songCount = songs?.length ?? 0;
+  const atCap = songCount >= LIBRARY_CAP;
+
   return (
     <Chrome>
       <View style={styles.container}>
         <View style={styles.header}>
-          <Text style={styles.title}>Your library</Text>
+          <View style={styles.titleBlock}>
+            <Text style={styles.title}>Your library</Text>
+            {songs && songs.length > 0 && (
+              <Text style={[styles.cap, atCap && styles.capFull]}>
+                {songCount} / {LIBRARY_CAP}
+                {atCap ? ' — full' : ''}
+              </Text>
+            )}
+          </View>
           <View style={styles.headerActions}>
             {onSignOut && <RetroButton label="Sign out" onPress={onSignOut} size="sm" />}
             {onYourTakes && (
               <RetroButton label="Your takes" onPress={onYourTakes} size="sm" />
             )}
-            <RetroButton label="+ Upload" onPress={onUpload} size="sm" variant="dark" />
+            <RetroButton
+              label={atCap ? 'Full' : '+ Upload'}
+              onPress={atCap ? () => undefined : onUpload}
+              size="sm"
+              variant={atCap ? undefined : 'dark'}
+            />
           </View>
         </View>
 
@@ -251,6 +272,8 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
             <Text style={styles.emptyExample}>
               Try a 1–3 minute song you know well — clear vocals work best.
               Or paste a SoundCloud, Bandcamp, or YouTube link.
+              {'\n\n'}
+              Up to {LIBRARY_CAP} songs in your library. Delete to swap.
             </Text>
             <View style={{ marginTop: 16 }}>
               <RetroButton label="Upload a song" onPress={onUpload} size="lg" icon="play" variant="dark" />
@@ -518,7 +541,10 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   headerActions: { flexDirection: 'row', gap: 8 },
+  titleBlock: { flex: 1, gap: 2 },
   title: { fontFamily: FONTS.chicago, fontWeight: '700', fontSize: 20, letterSpacing: -0.3 },
+  cap: { fontFamily: FONTS.monaco, fontSize: 11, color: COLORS.softGrey },
+  capFull: { color: '#c00' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10, paddingHorizontal: 8 },
   emptyIcon: { fontSize: 48 },

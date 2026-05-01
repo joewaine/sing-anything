@@ -75,8 +75,7 @@ export default function PasskeyScreen({ onUnlock, onShowPrivacy, onShowTerms }: 
           <Text style={styles.emoji}>🍏</Text>
           <Text style={styles.title}>Sing All The Time</Text>
           <Text style={styles.subtitle}>
-            Sign in with your email — your library and recordings stay tied to
-            it.
+            Pop in your email so your library stays yours. That's it.
           </Text>
         </View>
 
@@ -149,8 +148,7 @@ export default function PasskeyScreen({ onUnlock, onShowPrivacy, onShowTerms }: 
 
         <View style={styles.bottom}>
           <Text style={styles.hint}>
-            Your library is private — only you can see your uploads and
-            recordings.
+            No spam, no marketing. Just so I know who's who.
           </Text>
           {(onShowPrivacy || onShowTerms) && (
             <View style={styles.footer}>
