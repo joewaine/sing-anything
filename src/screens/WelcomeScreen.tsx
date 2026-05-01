@@ -15,6 +15,17 @@ export default function WelcomeScreen({ onContinue }: Props) {
           <Text style={styles.subtitle}>Upload a song. Practice a phrase. Sing it back.</Text>
         </View>
 
+        {/* Primary CTA + headphones hint sit right under the title so the
+            button is always above the fold — even on short viewports
+            (landscape phone, browser at half-height). The how-it-works
+            steps below stay visible on a normal screen but graciously
+            clip on the smallest ones; the user can already get into the
+            app from the button without seeing them. */}
+        <View style={styles.cta}>
+          <Text style={styles.hint}>🎧 headphones recommended</Text>
+          <RetroButton label="Let's sing" onPress={onContinue} size="lg" icon="play" />
+        </View>
+
         <View style={styles.steps}>
           <Row
             n="1"
@@ -31,11 +42,6 @@ export default function WelcomeScreen({ onContinue }: Props) {
             title="Hear what to try next"
             body="Pitch analysis and one warm sentence of feedback per take."
           />
-        </View>
-
-        <View style={styles.bottom}>
-          <Text style={styles.hint}>🎧 headphones recommended</Text>
-          <RetroButton label="Let's sing" onPress={onContinue} size="lg" icon="play" />
         </View>
       </View>
     </Chrome>
@@ -62,7 +68,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingTop: 40,
     paddingBottom: 32,
-    justifyContent: 'space-between',
+    gap: 24,
   },
   top: { alignItems: 'center', gap: 10 },
   apple: { fontSize: 56 },
@@ -78,7 +84,8 @@ const styles = StyleSheet.create({
     color: COLORS.black,
     textAlign: 'center',
   },
-  steps: { gap: 20, marginVertical: 32 },
+  cta: { alignItems: 'center', gap: 14 },
+  steps: { gap: 20 },
   row: { flexDirection: 'row', gap: 14, alignItems: 'flex-start' },
   numBubble: {
     width: 24,
@@ -103,6 +110,5 @@ const styles = StyleSheet.create({
     marginTop: 3,
     lineHeight: 17,
   },
-  bottom: { alignItems: 'center', gap: 14 },
   hint: { fontFamily: FONTS.monaco, fontSize: 12, color: COLORS.black },
 });
