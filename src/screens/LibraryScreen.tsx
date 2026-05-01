@@ -264,19 +264,18 @@ export default function LibraryScreen({ onUpload, onPickSong, onYourTakes, onCal
         ) : songs.length === 0 ? (
           <View style={styles.empty}>
             <Text style={styles.emptyIcon}>📼</Text>
-            <Text style={styles.emptyTitle}>No songs yet</Text>
+            <Text style={styles.emptyTitle}>Pick {LIBRARY_CAP} songs to practice</Text>
             <Text style={styles.emptyBody}>
-              Upload a track you own or have rights to practice with. We'll separate
-              the vocals, find the phrases, and get out of your way.
+              Pick songs you actually want to sing — verses you keep getting stuck
+              on, choruses you want to nail. Two minutes of processing per song,
+              then they're yours to come back to whenever.
             </Text>
             <Text style={styles.emptyExample}>
-              Try a 1–3 minute song you know well — clear vocals work best.
-              Or paste a SoundCloud, Bandcamp, or YouTube link.
-              {'\n\n'}
-              Up to {LIBRARY_CAP} songs in your library. Delete to swap.
+              Drop in an mp3 or paste a SoundCloud / Bandcamp / YouTube link.
+              Clear vocals work best.
             </Text>
             <View style={{ marginTop: 16 }}>
-              <RetroButton label="Upload a song" onPress={onUpload} size="lg" icon="play" variant="dark" />
+              <RetroButton label="Add your first song" onPress={onUpload} size="lg" icon="play" variant="dark" />
             </View>
             {error && <Text style={styles.errorText}>{error}</Text>}
           </View>

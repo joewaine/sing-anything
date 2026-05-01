@@ -13,11 +13,13 @@ type Props = {
 };
 
 // Minimum gap between consecutive notes (end of one to start of next)
-// before we insert a line break. Shorter than the original 600ms so
-// long phrases break into more, shorter lines — combined with text
-// wrapping (no numberOfLines clip), this prevents words from dropping
-// off the right edge.
-const LINE_BREAK_GAP_MS = 350;
+// before we insert a line break. 700ms aligns with the worker's
+// PHRASE_GAP_MS (800ms): within a single sung phrase, gaps are almost
+// always under 700ms, so we don't fragment a single line into multiple
+// visual rows just because a singer paused for emphasis. Long phrases
+// still wrap visually via text wrapping, but the SEMANTIC line breaks
+// only fire on real between-line pauses.
+const LINE_BREAK_GAP_MS = 700;
 // Lyric box shows at most VISIBLE_LINES rows of viewport. With wrapping
 // allowed, a single logical line may span multiple visual rows; the
 // translateY math below uses MEASURED line heights (onLayout) so the
